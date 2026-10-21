@@ -9,7 +9,7 @@
 // WorkBuddy/<version> is refused (error 10085).
 
 import { createHash, randomBytes } from "node:crypto"
-import { readFileSync } from "node:fs"
+import { closeSync, openSync, readFileSync, readSync, statSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
@@ -1595,6 +1595,343 @@ function capacity(v) {
 // compact is a count as magpie says one: whole, else to two places.
 const compact = (n) => (Number.isInteger(n) ? String(n) : n.toFixed(2).replace(/0+$/, "").replace(/\.$/, ""))
 
+// The window WorkBuddy AI rate limits its free models by, which its credit
+// meter does not show.
+//
+// A free account's usage() reports only the credits window, so a plan with
+// 160 credits untouched reads 0% while chats to deepseek-v4.1-flash are
+// already refused: the model has a token allowance of its own, counted
+// apart from credits, and nothing the vendor answers with reports it. The
+// refusal is the only place it appears, and only as a time:
+//
+//   429 usage exceeds frequency limit, but don't worry, your usage will
+//   reset at 2026-10-20 19:47:41 UTC+8, alternatively, you can switch to
+//   the other models to continue using it.
+//
+// Measured on a free plan over ten days (one account, deepseek-v4.1-flash
+// only), counting in + cache_read + out:
+//
+//   10-15 15:40 → 100,183,315  429      10-18 19:52 →  92,792,962  429
+//   10-16 16:48 →  99,971,831  429      10-19 19:47 →  98,201,537  429
+//   10-14 15:38 →  71,687,717  lapsed
+//
+// so the cap is per account per 24 hours at about 1e8 tokens, the largest
+// value that still answered being 100,183,315. Three things about it are
+// easy to get wrong and were all checked:
+//
+//   - cache_read counts. In + out alone is 20× smaller (0.75M–3.9M a
+//     window) and never comes near the cap.
+//   - the window is fixed, not sliding: peak trailing-24h over the same
+//     data is 172.85M, which a sliding window would have held to 1e8.
+//   - the reset a refusal names is the window's start + 24h exactly, and
+//     the start is the first request answered after the previous window
+//     ended — not the reset instant. Gaps of 6, 68, 80 and 182 minutes
+//     were seen between a reset and the next request, each opening the new
+//     window.
+//
+// deepseek-v4.1-flash-sg is the same model under its paid id (the product
+// config's ModelRateLimitCap.lines[0] names it as paidId to this freeId,
+// allowPaidSwitch: true) and draws on the same window: it was refused in
+// the same windows, to the second, with about 0.01M tokens of its own.
+// Both ids are named in models: magpie matches a plugin window's models
+// against a model id exactly, folding only an @size suffix
+// (internal/provider/plugin_usage.go, idSetOf), so one id alone leaves the
+// other unrestricted.
+//
+// The window is read two ways, and a refusal wins:
+//
+//   - the sum (in + cache_read + out) of this machine's rows, which holds
+//     until the account is first refused. The ledger is this machine's
+//     only, so an account also used on another machine or through another
+//     client reads short: 92.8M read as "93%" on one refused at 92,792,962,
+//     the rest of its spending being elsewhere.
+//   - a refusal whose named reset is still ahead, which makes the window
+//     full whatever the sum says. That is the one exact signal there is,
+//     and routing must not pass over it either.
+//
+// The ledger is magpie's own, in magpie's config folder (appdir.Config()):
+// the folder the plugin host runs in, which is the portable data folder
+// when magpie runs portable, $XDG_CONFIG_HOME/magpie when that is set, and
+// ~/.config/magpie otherwise. No endpoint reports the window; a ledger that
+// cannot be read yields no window rather than a made-up one.
+
+const FREE_WINDOW_CAP = 1e8
+const FREE_WINDOW_SPAN = 24 * 3600 * 1000
+// only rows this recent can bear on the window now: the ledger is appended
+// in time order, so the read starts at its end and stops once past this
+const FREE_WINDOW_KEEP = 48 * 3600 * 1000
+// the model the window is counted for; -sg shares it
+const FREE_WINDOW_MODEL = "deepseek-v4.1-flash"
+// both ids, so magpie's exact match finds the -sg one too
+const FREE_WINDOW_MODELS = ["deepseek-v4.1-flash", "deepseek-v4.1-flash-sg"]
+// the provider whose rows count
+const FREE_WINDOW_PROVIDER = "workbuddy-ai"
+
+// windowOffset is the UTC offset a refusal spells out, in minutes, from
+// "UTC+8", "UTC+08:00", "UTC-5" or "GMT+8". null when it spells out none,
+// which is not the same as +08:00: an offset guessed wrong puts the reset
+// hours from where it is, so a reset that cannot be placed is not used as
+// an edge at all.
+function windowOffset(text) {
+  const m = /\b(?:UTC|GMT)\s*([+-])\s*(\d{1,2})(?::?(\d{2}))?\b/i.exec(String(text ?? ""))
+  if (!m) return null
+  const min = Number(m[2]) * 60 + Number(m[3] ?? 0)
+  if (min > 14 * 60) return null
+  return m[1] === "-" ? -min : min
+}
+
+// windowReset is the instant a refusal names, or NaN when it names none or
+// names it in an offset that cannot be read.
+function windowReset(text) {
+  const s = String(text ?? "")
+  const at = /reset at (\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/.exec(s)
+  if (!at) return NaN
+  const off = windowOffset(s)
+  if (off === null) return NaN
+  return Date.UTC(+at[1], +at[2] - 1, +at[3], +at[4], +at[5], +at[6]) - off * 60000
+}
+
+// freeWindowOf is the window account is in now, from rows (magpie's usage
+// records), or null when it has lapsed — the next request opens a new one.
+// now is passed in so the reading is testable.
+function freeWindowOf(rows, account, now = Date.now()) {
+  const mine = (Array.isArray(rows) ? rows : []).filter(
+    (r) =>
+      r?.provider === FREE_WINDOW_PROVIDER &&
+      r.providerAccount === account &&
+      typeof r.model === "string" &&
+      r.model.startsWith(FREE_WINDOW_MODEL) &&
+      r.t,
+  )
+  if (!mine.length) return null
+
+  const at = (r) => {
+    const t = Date.parse(r.t)
+    return Number.isFinite(t) ? t : 0
+  }
+  const counted = (r) => (r.in ?? 0) + (r.cache_read ?? 0) + (r.out ?? 0)
+
+  // a refusal names its window's end, which is what pins a past one
+  const edges = new Set()
+  for (const r of mine) {
+    if (Number(r.status) !== 429) continue
+    const t = windowReset(r.err)
+    if (Number.isFinite(t)) edges.add(t)
+  }
+
+  const answered = mine.filter((r) => Number(r.status) === 200 && at(r) > 0).sort((a, b) => at(a) - at(b))
+  if (!answered.length) return null
+
+  let start = null
+  let used = 0
+  for (const r of answered) {
+    const t = at(r)
+    // an edge reached closes the window; the next request opens another
+    for (;;) {
+      const due = [...edges].filter((e) => (start === null || e > start) && e <= t).sort((a, b) => a - b)[0]
+      if (due === undefined) break
+      start = null
+      used = 0
+      edges.delete(due)
+    }
+    if (start === null) start = t
+    else if (t - start >= FREE_WINDOW_SPAN) {
+      start = t
+      used = 0
+    }
+    used += counted(r)
+  }
+  if (start === null) return null
+
+  const end = start + FREE_WINDOW_SPAN
+  if (now >= end) return null // lapsed: nothing is exhausted, a new window opens on the next request
+
+  const card = (amount, resetsAt, refused) => ({
+    name: "Free model tokens",
+    used: Math.min(100, (100 * amount) / FREE_WINDOW_CAP),
+    amount,
+    limit: FREE_WINDOW_CAP,
+    unit: "tokens",
+    display: `${tokensShort(amount)} / 100M`,
+    resetsAt: new Date(resetsAt).toISOString(),
+    span: FREE_WINDOW_SPAN / 1000,
+    models: FREE_WINDOW_MODELS.slice(),
+    ...(refused ? { refused: true } : {}),
+  })
+
+  // A refusal still in force is exact: the account is spending this window
+  // from elsewhere too, so the sum undercounts it, and the refusal is the
+  // answer the vendor would give again. Its reset is the window's end,
+  // named by the vendor rather than derived from start.
+  let live = null
+  for (const r of mine) {
+    if (Number(r.status) !== 429) continue
+    const t = windowReset(r.err)
+    if (!Number.isFinite(t) || t <= now || t <= start) continue
+    if (live === null || t > live) live = t
+  }
+  if (live !== null) return card(FREE_WINDOW_CAP, live, true)
+
+  return card(used, end, false)
+}
+
+// tokensShort says a token count small: 11.9M, 812k. The credits card's
+// compact() (2 decimals, credited to credits) reads a token count badly.
+function tokensShort(n) {
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`
+  if (n >= 1e3) return `${Math.round(n / 1e3)}k`
+  return String(Math.round(n))
+}
+
+// ledgerParsed is the rows read last and the fingerprint of the file they
+// came from, so a file that has not changed hands back the rows already
+// parsed rather than reading and decoding them again.
+//
+// Reading the ledger whole was 48 ms on 2026-10-21 (10.3 MiB, 17925 lines:
+// 6.4 ms to read, 32.8 ms to JSON.parse, 8 ms to find the window), spent
+// synchronously on the plugin host's thread every time a panel opened or a
+// card was asked about, which is what made the free-token window feel slow
+// beside the credits, whose reading is a network call and so blocks
+// nothing. A heavy ledger runs to hundreds of MiB and only the last 48
+// hours bear on the window, so the read starts at the end.
+let ledgerParsed = null
+
+// ledgerBad is the number of whole lines the ledger last had that could
+// not be decoded, and the file it was read from, so that a ledger read
+// once and read again is complained about once, not on every panel open.
+let ledgerBad = { key: "", count: 0 }
+
+// freeWindowLedger is the ledgers looked for, in magpie's own folder order
+// (appdir.Config()): the plugin host runs in that folder — the portable
+// data folder when magpie runs portable, $XDG_CONFIG_HOME/magpie when that
+// is set, ~/.config/magpie otherwise — so its cwd answers first; the other
+// two are named as well, for a plugin asked outside the host. The first
+// readable ledger wins: a stale copy in a folder magpie does not use must
+// not hide the live one.
+function freeWindowLedger(cwd = process.cwd(), env = process.env, home = homedir()) {
+  const dirs = [cwd]
+  if (env.XDG_CONFIG_HOME) dirs.push(join(env.XDG_CONFIG_HOME, "magpie"))
+  if (home) dirs.push(join(home, ".config", "magpie"))
+  return dirs.map((d) => join(d, "usage.jsonl"))
+}
+
+// freeWindowRows reads magpie's usage ledger, oldest row first. null when
+// no ledger can be read: the window is then left unknown rather than
+// guessed.
+//
+// The ledger is appended to a line at a time, so a read that lands while a
+// call is being written can catch that line half-written. Only the last
+// line can be torn that way (everything before it was written whole), and
+// only it is passed over in silence. A whole line in the middle that won't
+// decode is a real fault — a truncated file, a writer that lost a record —
+// and is said aloud, because passing it over quietly is how a window goes
+// missing with nothing to point at: on 2026-10-21 a restart caught the
+// ledger mid-write, the one row holding the free window's start was
+// dropped without a word, and the panel showed no window at all until the
+// next read happened to succeed.
+function freeWindowRows(now = Date.now(), cwd = process.cwd(), env = process.env, home = homedir()) {
+  let found = null
+  for (const path of freeWindowLedger(cwd, env, home)) {
+    try {
+      const st = statSync(path)
+      if (!st.size) continue
+      found = { path, st }
+      break
+    } catch {}
+  }
+  if (!found) return null
+  const { path, st } = found
+  // size and mtime both move when a call is appended, which is the only
+  // way this ledger is written; one rewritten in place (a rotation or a
+  // compaction) moves mtime even when its size lands the same.
+  const key = path + "|" + st.mtimeMs + ":" + st.size
+  if (ledgerParsed?.key === key) return ledgerParsed.rows
+  let got
+  try {
+    got = readLedgerTail(path, st, now)
+  } catch {
+    return null
+  }
+  if (got.bad && ledgerBad.key !== key) {
+    ledgerBad = { key, count: got.bad }
+    console.error(
+      `workbuddy: ${got.bad} whole line${got.bad === 1 ? "" : "s"} of ${path} could not be decoded ` +
+        `(not the last line, so not a write in progress); the free-token window may read short`,
+    )
+  }
+  ledgerParsed = { key, rows: got.rows }
+  return got.rows
+}
+
+// readLedgerTail decodes the ledger from its end backwards, keeping rows
+// from now - 48h on. A line that cannot name the provider is skipped before
+// it is decoded, which is most of a ledger shared with other providers.
+function readLedgerTail(path, st, now) {
+  const CHUNK = 1 << 16
+  const fd = openSync(path, "r")
+  try {
+    // a ledger whose last byte ends a line has no line being written
+    let tornEnd = false
+    if (st.size > 0) {
+      const one = Buffer.allocUnsafe(1)
+      readSync(fd, one, 0, 1, st.size - 1)
+      tornEnd = one[0] !== 0x0a
+    }
+    const rev = []
+    let bad = 0
+    let pos = st.size
+    let carry = ""
+    let firstPass = true
+    let stop = false
+    const floor = now - FREE_WINDOW_KEEP
+    while (pos > 0 && !stop) {
+      const len = Math.min(CHUNK, pos)
+      pos -= len
+      const buf = Buffer.allocUnsafe(len)
+      readSync(fd, buf, 0, len, pos)
+      const lines = (buf.toString("utf8") + carry).split("\n")
+      carry = lines.shift() // its first line is begun in an earlier chunk
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i]
+        if (!line.trim()) continue
+        if (!line.includes(FREE_WINDOW_PROVIDER)) continue
+        const torn = firstPass && tornEnd && i === lines.length - 1
+        let row
+        try {
+          row = JSON.parse(line)
+        } catch {
+          // the last line may be a call still being written; anything
+          // before it is a fault worth saying
+          if (!torn) bad++
+          continue
+        }
+        rev.push(row)
+        const t = Date.parse(row.t)
+        if (Number.isFinite(t) && t < floor) {
+          stop = true
+          break
+        }
+      }
+      firstPass = false
+    }
+    // the file's first line, with no newline before it
+    if (pos === 0 && carry.trim() && carry.includes(FREE_WINDOW_PROVIDER)) {
+      try {
+        rev.push(JSON.parse(carry))
+      } catch {
+        bad++
+      }
+    }
+    return { rows: rev.reverse(), bad }
+  } finally {
+    closeSync(fd)
+  }
+}
+
+// _internal is where these are handed to a test: magpie's host calls every
+// exported function of a plugin as one of its own factories (host.js,
+// servers()), so freeWindowRows et al. must not be exports of the plugin.
+
 // usageOf is the account's credits, from its resource summary: the plan's
 // credits used against what the cycle grants, as magpie's built-in said —
 // the count itself too (amount of limit, in credits), for magpie to say it
@@ -2168,6 +2505,15 @@ function makePlugin(site) {
             } catch {}
           }
           await spareFree(site, a, out.windows)
+          // the free model's own window, which the credit meter above does
+          // not show: what actually refuses a chat long before 160 credits
+          // are spent. WorkBuddy AI alone; the China build has no such cap
+          // measured (see freeWindowOf)
+          if (site.ai) {
+            const rows = freeWindowRows()
+            const w = rows && freeWindowOf(rows, a.accountId || a.user || a.uid || "")
+            if (w) out.windows.push(w)
+          }
           return { ...out, signIn: said }
         } catch (e) {
           return { error: e?.message ?? String(e), signIn: "kept" }
@@ -2291,4 +2637,4 @@ export const WorkBuddyAuthPlugin = makePlugin(SITES.workbuddy)
 export const WorkBuddyAIAuthPlugin = makePlugin(SITES["workbuddy-ai"])
 
 // for tests
-export const _internal = { typeUnions, systemAsUser, systemKey, DEFAULT_SYSTEM, EDGE_READS, fitShape, replyAfterTools, AFTER_TOOLS_REFUSED, enterpriseUsageOf, notDesktop, textOnly, runsOutOf, packagesOf, endOf, enterpriseHeaders, enterpriseOf, liveModels, browserSignIn, withSystem, normalizeToolChoice, fitTools, fitted, renamed, unflagged, usageOf, desktopHeld, explained, REFUSED_HINT, RESTRICTED_HINT, EXHAUSTED_HINT, freeCredits, creditsOf, priceOf, fresh, SITES, renewing, renewed, SESSION, attend, turnKey, conversationKey, signatureOf, isMessages, withoutUnsigned, withoutSignedThinking, answeredBefore, nativeOf, modelOf, configModels, API_MESSAGES: NPM_MESSAGES, API_CHAT: NPM }
+export const _internal = { typeUnions, systemAsUser, systemKey, DEFAULT_SYSTEM, EDGE_READS, fitShape, replyAfterTools, AFTER_TOOLS_REFUSED, enterpriseUsageOf, notDesktop, textOnly, runsOutOf, packagesOf, endOf, enterpriseHeaders, enterpriseOf, liveModels, browserSignIn, withSystem, normalizeToolChoice, fitTools, fitted, renamed, unflagged, usageOf, desktopHeld, explained, REFUSED_HINT, RESTRICTED_HINT, EXHAUSTED_HINT, freeCredits, creditsOf, priceOf, fresh, SITES, renewing, renewed, SESSION, attend, turnKey, conversationKey, signatureOf, isMessages, withoutUnsigned, withoutSignedThinking, answeredBefore, nativeOf, modelOf, configModels, freeWindowOf, tokensShort, freeWindowRows, freeWindowLedger, readLedgerTail, windowOffset, windowReset, FREE_WINDOW_MODELS, API_MESSAGES: NPM_MESSAGES, API_CHAT: NPM }
