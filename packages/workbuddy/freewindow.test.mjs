@@ -374,6 +374,36 @@ test("the review's probe: a run with no edge reads as the whole ledger", () => {
   }
 })
 
+// magpie appends the calls a client reports through POST
+// /v1/magpie/usage/requests to the same ledger (#1874), dated where the
+// client's call happened — a backfill reaching back on purpose
+// (docs/integrating.md). Such a line is written at the file's end, so its
+// time says nothing about where the read has got to: magpie's own index
+// leaves it out of firstOwn for the same reason. It never carries
+// providerAccount, so it is never a row of this account's either.
+test("a backfilled row of a client's does not end the read", () => {
+  const now = at("2026-10-22T12:00:00+08:00")
+  const rows = spread(now - 70 * AN_HOUR, now - AN_HOUR)
+  const reported = (t) => ({ t: new Date(t).toISOString(), agent: "myapp", provider: "openai", model: "gpt-5", in: 10, out: 5, status: 200, rid: "r1", source: "reported" })
+  // one, dated a day and an hour ago, and a batch of 50 behind the same run
+  for (const backfilled of [[reported(now - 25 * AN_HOUR)], Array.from({ length: 50 }, (_, i) => reported(now - (60 + i) * AN_HOUR))]) {
+    const root = writeLedger([...rows, ...backfilled].map((r) => JSON.stringify(r)))
+    try {
+      const whole = _internal.freeWindowOf(rows, "me@example.com", now)
+      const read = _internal.freeWindowRows("me@example.com", now, root, {}, join(root, "nohome"))
+      const w = read && _internal.freeWindowOf(read, "me@example.com", now)
+      // the card is there, and reads as the whole ledger does
+      expect(w).not.toBeNull()
+      expect(w.amount).toBe(whole.amount)
+      expect(w.resetsAt).toBe(whole.resetsAt)
+      // and none of them is this account's row
+      expect(read.every((r) => r.providerAccount === "me@example.com")).toBe(true)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  }
+})
+
 // The chain is this account's own: a refusal of another account's, or of a
 // paid model, says nothing about where this account's window opened
 test("another account's refusal does not pin this account", () => {
