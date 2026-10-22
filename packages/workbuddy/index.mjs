@@ -1657,9 +1657,22 @@ const compact = (n) => (Number.isInteger(n) ? String(n) : n.toFixed(2).replace(/
 
 const FREE_WINDOW_CAP = 1e8
 const FREE_WINDOW_SPAN = 24 * 3600 * 1000
-// only rows this recent can bear on the window now: the ledger is appended
-// in time order, so the read starts at its end and stops once past this
+// The least the read reaches back, and the floor it stops at when the rows
+// above it settle the chain on their own (see readLedgerTail).
 const FREE_WINDOW_KEEP = 48 * 3600 * 1000
+// A gap this long between two of this account's answered rows ends every
+// window before it, so the later row opens one: the window holding the
+// earlier row began at most 24h before it, and so ended 24h after it at the
+// latest. This is one of the two edges the ledger itself spells out.
+const FREE_WINDOW_GAP = FREE_WINDOW_SPAN
+// How far back from an edge the read goes on, a day before the reset or the
+// gap it stops at. freeWindowOf reads the window now from the rows alone, so
+// the rows must reach back to where that reading stops for the ledger: the
+// boundary of the last window's start. The window opens at the row after the
+// edge, one hour in the ledger seen (gaps of 6 minutes to 182 were measured),
+// so a day below it leaves a whole window above that boundary however the
+// first row after the edge falls.
+const FREE_WINDOW_LEAD = 86400 * 1000
 // the model the window is counted for; -sg shares it
 const FREE_WINDOW_MODEL = "deepseek-v4.1-flash"
 // both ids, so magpie's exact match finds the -sg one too
@@ -1694,6 +1707,12 @@ function windowReset(text) {
 // freeWindowOf is the window account is in now, from rows (magpie's usage
 // records), or null when it has lapsed — the next request opens a new one.
 // now is passed in so the reading is testable.
+//
+// The window is a chain: it begins at the first request answered after the
+// previous one ended, so where this window began depends on every window
+// before it. A window ends at a refusal's reset when the ledger holds one,
+// and otherwise a day after it began. readLedgerTail (which see) stops on
+// both, so that these rows read the same as the whole ledger.
 function freeWindowOf(rows, account, now = Date.now()) {
   const mine = (Array.isArray(rows) ? rows : []).filter(
     (r) =>
@@ -1710,38 +1729,42 @@ function freeWindowOf(rows, account, now = Date.now()) {
     return Number.isFinite(t) ? t : 0
   }
   const counted = (r) => (r.in ?? 0) + (r.cache_read ?? 0) + (r.out ?? 0)
+  // two rows a day apart: the first of them opened a window that has ended by
+  // the second. Written as a function so that no minifier folds the
+  // subtraction into the comparison.
+  const apart = (a, b) => a - b >= FREE_WINDOW_SPAN
 
-  // a refusal names its window's end, which is what pins a past one
-  const edges = new Set()
+  // a refusal names the end of the window it refused in
+  const edges = []
   for (const r of mine) {
     if (Number(r.status) !== 429) continue
     const t = windowReset(r.err)
-    if (Number.isFinite(t)) edges.add(t)
+    if (Number.isFinite(t)) edges.push(t)
   }
+  edges.sort((a, b) => a - b)
 
   const answered = mine.filter((r) => Number(r.status) === 200 && at(r) > 0).sort((a, b) => at(a) - at(b))
   if (!answered.length) return null
 
   let start = null
   let used = 0
+  let edge = 0 // the refusals already read
   for (const r of answered) {
     const t = at(r)
-    // an edge reached closes the window; the next request opens another
-    for (;;) {
-      const due = [...edges].filter((e) => (start === null || e > start) && e <= t).sort((a, b) => a - b)[0]
-      if (due === undefined) break
+    // every refusal this row's window ended at closes it
+    while (edge < edges.length && edges[edge] <= t) {
       start = null
       used = 0
-      edges.delete(due)
+      edge++
     }
     if (start === null) start = t
-    else if (t - start >= FREE_WINDOW_SPAN) {
+    else if (apart(t, start)) {
       start = t
       used = 0
     }
     used += counted(r)
   }
-  if (start === null) return null
+  if (!(start > 0)) return null
 
   const end = start + FREE_WINDOW_SPAN
   if (now >= end) return null // lapsed: nothing is exhausted, a new window opens on the next request
@@ -1863,11 +1886,58 @@ function freeWindowRows(now = Date.now(), cwd = process.cwd(), env = process.env
   return got.rows
 }
 
-// readLedgerTail decodes the ledger from its end backwards, keeping rows
-// from now - 48h on. A line that cannot name the provider is skipped before
-// it is decoded, which is most of a ledger shared with other providers.
-function readLedgerTail(path, st, now) {
+// LEDGER_T is where a row's time sits: "t" is among the first keys
+// usage.Record writes, within this many bytes of the line's start, so every
+// line's time is read without decoding the line — most of a ledger's lines
+// belong to another provider, or to this account and are out of reach.
+const LEDGER_T = /"t"\s*:\s*"([^"]{10,64})"/
+
+// rowTime is the instant a line is written at, from that "t", or NaN.
+function rowTime(line) {
+  const m = LEDGER_T.exec(line)
+  return m ? Date.parse(m[1]) : NaN
+}
+
+// readLedgerTail decodes the ledger from its end backwards, and stops where
+// the chain of rows it hands over is still read from. chunks is a test's way
+// of counting reads; nothing else passes it.
+//
+// Why it cannot simply stop at 48h: the window is a chain — each one starts
+// at the first request answered after the previous one ended — so where the
+// window now began depends on every window before it. A first row that is
+// not an edge opens the window in the middle of a real one and every window
+// after it is shifted: 4% on an account two hours from its cap, or 100% on
+// one still served, which routing would then pass over. So the read goes
+// back until the rows it keeps read the window now as the whole ledger does:
+//
+//   - a refusal whose reset can be read: the window it names ended there and
+//     the next request opened another. The read goes on a day past it, so
+//     that the day's span has room to close the windows before it.
+//   - a gap of 24h or more between two of this account's answered rows: the
+//     window holding the earlier one has ended by then, and the later one
+//     opens one. The read goes a day past it, for the same reason.
+//   - two days of rows with no gap and no refusal among them: wherever the
+//     last window opened, these rows cover a whole one, so the span's own
+//     reading is the ledger's — and that reading is measured from the floor,
+//     so neither does a row appended at the tail move it.
+//
+// Neither edge is among the newest rows, so the read goes back until one
+// turns up: through a whole file of other providers when the account was last
+// used weeks ago, and to the file's start when it has never been refused nor
+// idle.
+//
+// Every line's time is read before the line is decoded — "t" is among the
+// first keys usage.Record writes — so a line of another provider, or of this
+// account and out of reach, costs one match and no JSON.parse.
+//
+// What is not covered: magpie's providerAccount is the account's label, and a
+// label two accounts share gets its slot added to it (pluginLabels,
+// plugin_accounts.go). The label then no longer equals the accountId rows are
+// written under, no row is found for this account at all, and the card
+// reports no free window.
+function readLedgerTail(path, st, now, chunks) {
   const CHUNK = 1 << 16
+  const floor = now - FREE_WINDOW_KEEP
   const fd = openSync(path, "r")
   try {
     // a ledger whose last byte ends a line has no line being written
@@ -1877,55 +1947,97 @@ function readLedgerTail(path, st, now) {
       readSync(fd, one, 0, 1, st.size - 1)
       tornEnd = one[0] !== 0x0a
     }
-    const rev = []
+    const rev = [] // the rows kept, latest first
     let bad = 0
     let pos = st.size
     let carry = ""
     let firstPass = true
     let stop = false
-    const floor = now - FREE_WINDOW_KEEP
+    let chain = [] // this account's rows read, latest first
+    let reach = 0 // the row below which nothing is kept: 0 until pinned
+
     while (pos > 0 && !stop) {
       const len = Math.min(CHUNK, pos)
       pos -= len
       const buf = Buffer.allocUnsafe(len)
       readSync(fd, buf, 0, len, pos)
+      if (chunks) chunks(1)
       const lines = (buf.toString("utf8") + carry).split("\n")
       carry = lines.shift() // its first line is begun in an earlier chunk
-      for (let i = lines.length - 1; i >= 0; i--) {
+      for (let i = lines.length - 1; i >= 0 && !stop; i--) {
         const line = lines[i]
         if (!line.trim()) continue
+        const t = rowTime(line)
+        // Under the row the chain is read from: nothing below it is kept
+        if (reach && Number.isFinite(t) && t < reach) {
+          stop = true
+          break
+        }
+        // Another provider's line: its time is all this needs
         if (!line.includes(FREE_WINDOW_PROVIDER)) continue
-        const torn = firstPass && tornEnd && i === lines.length - 1
         let row
         try {
           row = JSON.parse(line)
         } catch {
-          // the last line may be a call still being written; anything
-          // before it is a fault worth saying
-          if (!torn) bad++
+          // the last line may be a call still being written, and is passed
+          // over; anything before it is a fault worth saying
+          if (!(firstPass && tornEnd && i === lines.length - 1)) bad++
           continue
         }
         rev.push(row)
-        const t = Date.parse(row.t)
-        if (Number.isFinite(t) && t < floor) {
-          stop = true
-          break
-        }
+        chain.push(row)
+        if (!reach) reach = pinned(chain, floor)
       }
       firstPass = false
     }
-    // the file's first line, with no newline before it
-    if (pos === 0 && carry.trim() && carry.includes(FREE_WINDOW_PROVIDER)) {
-      try {
-        rev.push(JSON.parse(carry))
-      } catch {
-        bad++
+    // the file's first line, with no newline before it: kept only when the
+    // read ran to the file's start
+    if (!stop && pos === 0 && carry.trim() && carry.includes(FREE_WINDOW_PROVIDER)) {
+      const t = rowTime(carry)
+      if (!reach || !Number.isFinite(t) || t >= reach) {
+        try {
+          rev.push(JSON.parse(carry))
+        } catch {
+          bad++
+        }
       }
     }
     return { rows: rev.reverse(), bad }
   } finally {
     closeSync(fd)
   }
+}
+
+// pinned is where the chain of rows (latest first) is read from: the time
+// below which nothing is kept, Infinity when only the file's start is. 0
+// while the rows say nothing about it yet.
+function pinned(rows, floor) {
+  const at = (r) => Date.parse(r?.t)
+  const apart = (a, b) => a - b >= FREE_WINDOW_GAP
+  const reaches = (a, b) => a - b >= 2 * FREE_WINDOW_SPAN
+  const newest = at(rows[0])
+  if (!Number.isFinite(newest)) return Infinity
+  const first = at(rows[rows.length - 1])
+  // a refusal names where a window ended; the earliest one read is the edge
+  for (let i = rows.length - 1; i >= 0; i--) {
+    if (Number(rows[i]?.status) !== 429) continue
+    const reset = windowReset(rows[i].err)
+    if (Number.isFinite(reset) && reset < newest) return reset - FREE_WINDOW_LEAD
+  }
+  if (!Number.isFinite(first)) return floor
+  // two days of rows with no gap among them settle it: the span's reading is
+  // the ledger's, and it stops at the floor.
+  if (reaches(newest, first)) return floor
+  // a gap nearer the newest row says where a window opened, which the floor
+  // read on its own would miss; the day before it is where that reading of
+  // the rows above the gap begins
+  for (let i = 1; i < rows.length; i++) {
+    const above = at(rows[i - 1])
+    const t = at(rows[i])
+    if (!Number.isFinite(t)) return floor
+    if (apart(above, t)) return t - FREE_WINDOW_LEAD
+  }
+  return 0
 }
 
 // _internal is where these are handed to a test: magpie's host calls every
@@ -2637,4 +2749,4 @@ export const WorkBuddyAuthPlugin = makePlugin(SITES.workbuddy)
 export const WorkBuddyAIAuthPlugin = makePlugin(SITES["workbuddy-ai"])
 
 // for tests
-export const _internal = { typeUnions, systemAsUser, systemKey, DEFAULT_SYSTEM, EDGE_READS, fitShape, replyAfterTools, AFTER_TOOLS_REFUSED, enterpriseUsageOf, notDesktop, textOnly, runsOutOf, packagesOf, endOf, enterpriseHeaders, enterpriseOf, liveModels, browserSignIn, withSystem, normalizeToolChoice, fitTools, fitted, renamed, unflagged, usageOf, desktopHeld, explained, REFUSED_HINT, RESTRICTED_HINT, EXHAUSTED_HINT, freeCredits, creditsOf, priceOf, fresh, SITES, renewing, renewed, SESSION, attend, turnKey, conversationKey, signatureOf, isMessages, withoutUnsigned, withoutSignedThinking, answeredBefore, nativeOf, modelOf, configModels, freeWindowOf, tokensShort, freeWindowRows, freeWindowLedger, readLedgerTail, windowOffset, windowReset, FREE_WINDOW_MODELS, API_MESSAGES: NPM_MESSAGES, API_CHAT: NPM }
+export const _internal = { typeUnions, systemAsUser, systemKey, DEFAULT_SYSTEM, EDGE_READS, fitShape, replyAfterTools, AFTER_TOOLS_REFUSED, enterpriseUsageOf, notDesktop, textOnly, runsOutOf, packagesOf, endOf, enterpriseHeaders, enterpriseOf, liveModels, browserSignIn, withSystem, normalizeToolChoice, fitTools, fitted, renamed, unflagged, usageOf, desktopHeld, explained, REFUSED_HINT, RESTRICTED_HINT, EXHAUSTED_HINT, freeCredits, creditsOf, priceOf, fresh, SITES, renewing, renewed, SESSION, attend, turnKey, conversationKey, signatureOf, isMessages, withoutUnsigned, withoutSignedThinking, answeredBefore, nativeOf, modelOf, configModels, freeWindowOf, tokensShort, freeWindowRows, freeWindowLedger, readLedgerTail, pinned, rowTime, windowOffset, windowReset, FREE_WINDOW_MODELS, FREE_WINDOW_KEEP, FREE_WINDOW_SPAN, FREE_WINDOW_GAP, FREE_WINDOW_LEAD, API_MESSAGES: NPM_MESSAGES, API_CHAT: NPM }

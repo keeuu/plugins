@@ -278,8 +278,21 @@ What is measured, and what is easy to read wrongly:
   the other unrestricted.
 - **The ledger is read in magpie's own folder** (`appdir.Config()`: the
   portable data folder, `$XDG_CONFIG_HOME/magpie`, or `~/.config/magpie`),
-  from its end backwards, stopping once past 48 hours — a heavy ledger runs
-  to hundreds of MB and only those hours bear on the window.
+  from its end backwards — a heavy ledger runs to hundreds of MB.
+  - The window is a chain, so where it now began depends on every window
+    before it: read a slice of the ledger that starts mid-chain and every
+    window after it is shifted (4% on an account two hours from its cap, or
+    100% on one still served). The read therefore goes back past 48 hours
+    until the rows can be read on their own — to a refusal whose reset can
+    be read, to a gap of a day between two requests, or two days back —
+    plus a day below that, and further only when the account was last used
+    longer ago than that.
+  - Every line's time is read before the line is decoded, so a line of
+    another provider (or of this account and out of reach) ends the read
+    without being parsed.
+  - `providerAccount` is the account's label. Two accounts sharing a label
+    get its slot added (`pluginLabels`), the label no longer matches what
+    their rows were written under, and the card reports no free window.
 - **The offset comes from the refusal's words** (`UTC+8`, `GMT-5`,
   `UTC+05:30`). A reset whose offset cannot be read is no edge at all,
   rather than +08:00 guessed.
