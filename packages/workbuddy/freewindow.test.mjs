@@ -147,7 +147,7 @@ test("the card reads a token count, not a credits count", () => {
 
 test("no ledger means no window rather than a guess", () => {
   // HOME is a temp dir in tests and no folder it reads holds a ledger
-  expect(_internal.freeWindowRows(Date.now(), join(homedir(), "magpie-test-nowhere"), {}, homedir())).toBeNull()
+  expect(_internal.freeWindowRows("me@example.com", Date.now(), join(homedir(), "magpie-test-nowhere"), {}, homedir())).toBeNull()
 })
 
 // --- the review's points, each red on 33ca87f8 -------------------------
@@ -205,7 +205,7 @@ test("the ledger is found through $XDG_CONFIG_HOME", () => {
     mkdirSync(join(xdg, "magpie"), { recursive: true })
     writeFileSync(join(home, ".config", "magpie", "usage.jsonl"), JSON.stringify(row("2026-10-01T10:00:00+08:00", { in: 1 })) + "\n")
     writeFileSync(join(xdg, "magpie", "usage.jsonl"), JSON.stringify(row("2026-10-20T10:00:00+08:00", { in: 5_000_000 })) + "\n")
-    const rows = _internal.freeWindowRows(at("2026-10-20T12:00:00+08:00"), join(root, "elsewhere"), { XDG_CONFIG_HOME: xdg }, home)
+    const rows = _internal.freeWindowRows("me@example.com", at("2026-10-20T12:00:00+08:00"), join(root, "elsewhere"), { XDG_CONFIG_HOME: xdg }, home)
     expect(rows.map((r) => r.in)).toEqual([5_000_000])
   } finally {
     rmSync(root, { recursive: true, force: true })
@@ -216,17 +216,17 @@ test("the ledger is found through the folder the host runs in", () => {
   const root = mkdtempSync(join(tmpdir(), "wb-cwd-"))
   try {
     writeFileSync(join(root, "usage.jsonl"), JSON.stringify(row("2026-10-20T10:00:00+08:00", { in: 7_000_000 })) + "\n")
-    const rows = _internal.freeWindowRows(at("2026-10-20T12:00:00+08:00"), root, {}, join(root, "nohome"))
+    const rows = _internal.freeWindowRows("me@example.com", at("2026-10-20T12:00:00+08:00"), root, {}, join(root, "nohome"))
     expect(rows.map((r) => r.in)).toEqual([7_000_000])
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
 })
 
-// point 4: a heavy ledger runs to hundreds of MB, so the read starts at the
-// end and stops once back past the tail — 48 hours, or further when the
-// chain needs it
-test("the read stops once past 48 hours, from the end", () => {
+// point 4: a heavy ledger runs to hundreds of MB, so the read starts at its
+// end. Where it stops is the chain's business (see the probes below); with no
+// edge in reach it goes back to an edge it can stand on, or to the file's end.
+test("the read starts at the file's end", () => {
   const root = mkdtempSync(join(tmpdir(), "wb-tail-"))
   try {
     const now = at("2026-10-20T20:00:00+08:00")
@@ -234,12 +234,9 @@ test("the read stops once past 48 hours, from the end", () => {
     for (let i = 0; i < 3000; i++) lines.push(JSON.stringify(row(new Date(now - (2999 - i) * 3600_000).toISOString(), { in: i === 2999 ? 9_000_000 : 1 })))
     lines.push(JSON.stringify({ ...row(new Date(now).toISOString(), { in: 4 }), provider: "zcode" }))
     writeFileSync(join(root, "usage.jsonl"), lines.join("\n") + "\n" + '{"provider":"workbuddy-ai","t":"2026-10-20T')
-    const rows = _internal.freeWindowRows(now, root, {}, join(root, "nohome"))
-    // the last 48h of rows, plus the day before the row they open on: 73
-    // of the 3000, not the 3000
-    expect(rows.length).toBeLessThan(120)
+    const rows = _internal.freeWindowRows("me@example.com", now, root, {}, join(root, "nohome"))
     expect(rows.every((r) => r.provider === "workbuddy-ai")).toBe(true)
-    expect(rows.at(-1).in).toBe(9_000_000)
+    expect(rows.at(-1).in).toBe(9_000_000) // the newest row, and never the torn one
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
@@ -290,7 +287,7 @@ test("a day of rows pins the chain where the whole ledger does", () => {
   const root = spreadLedger(rows, now)
   try {
     const whole = _internal.freeWindowOf(rows, "me@example.com", now)
-    const read = _internal.freeWindowRows(now, root, {}, join(root, "nohome"))
+    const read = _internal.freeWindowRows("me@example.com", now, root, {}, join(root, "nohome"))
     // the read goes past the 48h tail to the day before where the gap lets
     // the chain be read: the tail alone holds 41 of these rows
     expect(read.length).toBeGreaterThan(41)
@@ -316,7 +313,7 @@ test("a refusal the read reaches pins the window exactly", () => {
   ].sort((a, b) => Date.parse(a.t) - Date.parse(b.t))
   const root = spreadLedger(refused, now)
   try {
-    const w = _internal.freeWindowOf(_internal.freeWindowRows(now, root, {}, join(root, "nohome")), "me@example.com", now)
+    const w = _internal.freeWindowOf(_internal.freeWindowRows("me@example.com", now, root, {}, join(root, "nohome")), "me@example.com", now)
     // the refusal names the window's end; the window holding now opened on
     // the span after it, and the rows read say the same as all of them
     const whole = _internal.freeWindowOf(refused, "me@example.com", now)
@@ -332,21 +329,66 @@ test("a refusal the read reaches pins the window exactly", () => {
 // gap opens one: the second thing that pins the chain without a refusal
 test("a gap of a day or more pins the chain too", () => {
   const now = at("2026-10-22T12:00:00+08:00")
-  // served hourly for four days, idle for 30h, then served hourly for 20h
-  const rows = spread(now - 96 * AN_HOUR, now - 30 * AN_HOUR).concat(spread(now - 20 * AN_HOUR, now))
+  // served hourly until 50h ago, then nothing for 30h, then hourly since
+  const rows = spread(now - 100 * AN_HOUR, now - 50 * AN_HOUR).concat(spread(now - 20 * AN_HOUR, now))
   const root = spreadLedger(rows, now)
   try {
     const whole = _internal.freeWindowOf(rows, "me@example.com", now)
-    // the idle ended every window before it, so the window now is the one
-    // the first row after it opened, 20h ago
+    // the idle ended every window before it, so the window now is the one the
+    // first row after it opened, 20h ago
     expect(whole.amount).toBe(21 * 4_000_000)
     expect(whole.resetsAt).toBe(iso(new Date(now - 20 * AN_HOUR + A_DAY)))
 
-    const read = _internal.freeWindowRows(now, root, {}, join(root, "nohome"))
+    const read = _internal.freeWindowRows("me@example.com", now, root, {}, join(root, "nohome"))
     const w = _internal.freeWindowOf(read, "me@example.com", now)
-    // 40 rows read: the 21 after the idle, and 19 of the day before it, which
-    // is where the span's reading begins
-    expect(read.length).toBe(40)
+    // the read stops a day before the row after the idle: the 21 rows since
+    // it, and the 25 of the day before the gap — not the 100 before them
+    expect(read.length).toBe(46)
+    expect(w.amount).toBe(whole.amount)
+    expect(w.resetsAt).toBe(whole.resetsAt)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// The review's probe, unchanged: hourly rows for 70h, 4M of cache_read each,
+// six days after the last of them is 2000 rows of another provider, and no
+// refusal anywhere. With no edge to stand at there is no window chain to be
+// read, so the whole ledger and the read agree — and a run of use with no gap
+// and no refusal is exactly that: there is no window edge in it to find.
+test("the review's probe: a run with no edge reads as the whole ledger", () => {
+  const now = at("2026-10-22T12:00:00+08:00")
+  // rows from two hours before the file's other rows, so the tail read alone
+  // would still open the window mid-run
+  const rows = spread(now - 70 * AN_HOUR, now - 1 * AN_HOUR)
+  const root = spreadLedger(rows, now)
+  try {
+    const whole = _internal.freeWindowOf(rows, "me@example.com", now)
+    const read = _internal.freeWindowRows("me@example.com", now, root, {}, join(root, "nohome"))
+    const w = _internal.freeWindowOf(read, "me@example.com", now)
+    expect(read.length).toBe(rows.length) // every row: no edge, so the file's start
+    expect(w.amount).toBe(whole.amount)
+    expect(w.resetsAt).toBe(whole.resetsAt)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// The chain is this account's own: a refusal of another account's, or of a
+// paid model, says nothing about where this account's window opened
+test("another account's refusal does not pin this account", () => {
+  const now = at("2026-10-22T12:00:00+08:00")
+  const rows = spread(now - 70 * AN_HOUR, now - 1 * AN_HOUR)
+  const root = spreadLedger(
+    [...rows, row(new Date(now - 30 * AN_HOUR).toISOString(), { status: 429, account: "b@example.com", err: `${TIMEOUT_BEFORE_RESET}2026-10-22 09:00:00 UTC+8, alternatively, you can switch to the other models to continue using it.` })].sort((a, b) => Date.parse(a.t) - Date.parse(b.t)),
+    now,
+  )
+  try {
+    const whole = _internal.freeWindowOf(rows, "me@example.com", now)
+    const read = _internal.freeWindowRows("me@example.com", now, root, {}, join(root, "nohome"))
+    // the other account's row is not this account's, and is not kept either
+    expect(read.every((r) => r.providerAccount === "me@example.com")).toBe(true)
+    const w = _internal.freeWindowOf(read, "me@example.com", now)
     expect(w.amount).toBe(whole.amount)
     expect(w.resetsAt).toBe(whole.resetsAt)
   } finally {
@@ -357,55 +399,63 @@ test("a gap of a day or more pins the chain too", () => {
 // A ledger under one chunk used to line the chain up by luck: the file's
 // first line was parsed and kept even after the loop had stopped on an older
 // row, so a stray row far back opened the window and the answer was right by
-// accident. Keep it only when the read runs to the file's start.
+// accident. It is kept only when the read runs to the file's start.
 test("the file's first line is kept only when the read runs to the start", () => {
   const now = at("2026-10-20T20:00:00+08:00")
   const lines = [
-    JSON.stringify(row(new Date(now - 100 * 3600_000).toISOString(), { in: 1 })), // under the stop
-    JSON.stringify(row(new Date(now - 50 * 3600_000).toISOString(), { in: 2 })), // the row a 48h tail keeps
+    JSON.stringify(row(new Date(now - 20 * 3600_000).toISOString(), { in: 1 })), // the file's first line
+    JSON.stringify(row(new Date(now - 10 * 3600_000).toISOString(), { in: 2 })),
     JSON.stringify(row(new Date(now - 60 * 60_000).toISOString(), { in: 3 })),
   ]
   const root = writeLedger(lines)
   try {
-    const rows = _internal.freeWindowRows(now, root, {}, join(root, "nohome"))
-    // on 9a609cf this kept the first line as well, a stray row 50h old that
-    // opened the window
-    expect(rows.map((r) => r.in)).toEqual([2, 3])
+    const rows = _internal.freeWindowRows("me@example.com", now, root, {}, join(root, "nohome"))
+    // with no edge in reach the read goes back to the start, and then the
+    // first line is a row of the ledger like any other
+    expect(rows.map((r) => r.in)).toEqual([1, 2, 3])
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
-  // a ledger that never leaves the tail keeps all of it, first line included
-  const small = writeLedger([JSON.stringify(row(new Date(now - 90 * 60_000).toISOString(), { in: 1 })), JSON.stringify(row(new Date(now - 60 * 60_000).toISOString(), { in: 2 }))])
+  // a day's gap stops the read with rows under it: the first line is under
+  // that stop and is not kept
+  const gap = at("2026-10-20T20:00:00+08:00")
+  const stopped = writeLedger([
+    JSON.stringify(row(new Date(gap - 90 * 3600_000).toISOString(), { in: 1 })), // under the stop
+    JSON.stringify(row(new Date(gap - 80 * 3600_000).toISOString(), { in: 2 })), // the gap's earlier side
+    JSON.stringify(row(new Date(gap - 50 * 3600_000).toISOString(), { in: 3 })), // 30h later: a window opens
+    JSON.stringify(row(new Date(gap - 3600_000).toISOString(), { in: 4 })),
+  ])
   try {
-    expect(_internal.freeWindowRows(now, small, {}, join(small, "nohome")).map((r) => r.in)).toEqual([1, 2])
+    const rows = _internal.freeWindowRows("me@example.com", gap, stopped, {}, join(stopped, "nohome"))
+    // 3 and 4: the day before the gap's later row stopped the read, and the
+    // first line, 10h under it, is not kept
+    expect(rows.map((r) => r.in)).toEqual([3, 4])
   } finally {
-    rmSync(small, { recursive: true, force: true })
+    rmSync(stopped, { recursive: true, force: true })
   }
 })
 
-// The time stop must see every line: a row of another provider skipped for
-// its provider alone is a line whose time is never read, so a ledger whose
-// last this-account row is weeks old — or missing — is read whole on every
-// panel open. The time comes near the start of the line, so it is read cheap.
-test("a ledger with this account long unused is not read whole", () => {
+// The read must be bounded by what it can report, not by how busy the account
+// is. A ledger of another provider's rows, with this account's only row 60
+// days back, is read from its end and stops a day in: a lapsed window is
+// nothing to report, and no row above the day can open one.
+test("a ledger of another provider's rows is not read whole", () => {
   const now = at("2026-10-20T20:00:00+08:00")
   const lines = [JSON.stringify(row(new Date(now - 60 * 24 * 3600_000).toISOString(), { in: 5 }))]
-  for (let i = 0; i < 4000; i++) lines.push(JSON.stringify(row(new Date(now - (4000 - i) * 60_000).toISOString(), { in: 1, provider: "zcode" })))
+  // a fortnight of another provider's rows, a minute apart: nine days of them
+  // are past the day the read stops at
+  for (let i = 0; i < 20000; i++) lines.push(JSON.stringify(row(new Date(now - (20000 - i) * 60_000).toISOString(), { in: 1, provider: "zcode" })))
   const root = writeLedger(lines)
   try {
     let chunks = 0
     const path = join(root, "usage.jsonl")
-    const got = _internal.readLedgerTail(path, statSync(path), now, () => chunks++)
-    // nothing of this account is in the tail, so nothing of it is kept; one
-    // row comes back because the file's first line is not passed over in
-    // silence, and freeWindowOf finds no window of this account in it
-    const stale = got.rows.filter((r) => r.provider === "workbuddy-ai")
-    // one is asserted enough to name the fault, and it is 60 days old
-    expect(stale.every((r) => Date.parse(r.t) < now - 47 * 3600_000)).toBe(true)
-    expect(stale.length).toBeLessThan(3)
+    const got = _internal.readLedgerTail(path, statSync(path), now, () => chunks++, "me@example.com")
+    const all = Math.ceil(statSync(path).size / 65536)
+    // the read stops a day into the file, so a tenth of it or so, never all
+    expect(chunks).toBeLessThan(all / 4)
+    expect(chunks).toBeGreaterThan(0)
+    expect(got.rows.filter((r) => r.provider === "workbuddy-ai").length).toBeLessThan(3)
     expect(_internal.freeWindowOf(got.rows, "me@example.com", now)).toBeNull()
-    // 4000 minutes of rows is some 500 KiB — read from the end, not all of it
-    expect(chunks).toBeLessThan(12)
   } finally {
     rmSync(root, { recursive: true, force: true })
   }

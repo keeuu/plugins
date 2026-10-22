@@ -277,19 +277,22 @@ What is measured, and what is easy to read wrongly:
   (only an `@size` suffix folds into the bare id), so one alone would leave
   the other unrestricted.
 - **The ledger is read in magpie's own folder** (`appdir.Config()`: the
-  portable data folder, `$XDG_CONFIG_HOME/magpie`, or `~/.config/magpie`),
-  from its end backwards — a heavy ledger runs to hundreds of MB.
+  portable data folder, `$XDG_CONFIG_HOME/magpie` when that is set (an
+  absolute path, as `appdir.rooted` has it), or `~/.config/magpie`), from its
+  end backwards — a heavy ledger runs to hundreds of MB.
   - The window is a chain, so where it now began depends on every window
     before it: read a slice of the ledger that starts mid-chain and every
     window after it is shifted (4% on an account two hours from its cap, or
-    100% on one still served). The read therefore goes back past 48 hours
-    until the rows can be read on their own — to a refusal whose reset can
-    be read, to a gap of a day between two requests, or two days back —
-    plus a day below that, and further only when the account was last used
-    longer ago than that.
-  - Every line's time is read before the line is decoded, so a line of
-    another provider (or of this account and out of reach) ends the read
-    without being parsed.
+    100% on one still served). The read therefore goes back until it reaches
+    an edge this account's own rows spell out — a refusal whose reset can be
+    read, or a gap of a day between two of its answered rows — plus a day
+    below that, and with neither it reads to the file's start, where there is
+    no earlier window to be shifted by.
+  - Nothing bounds that by age, so two things keep a heavy ledger cheap: a
+    line's time is read before the line is decoded, so a line under the edge
+    (of any provider or account) ends the read at once; and a read past 24h
+    with no answered free-model row of this account stops, since the window
+    has lapsed and nothing would be reported.
   - `providerAccount` is the account's label. Two accounts sharing a label
     get its slot added (`pluginLabels`), the label no longer matches what
     their rows were written under, and the card reports no free window.
