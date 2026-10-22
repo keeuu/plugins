@@ -1619,6 +1619,22 @@ function rowTime(line) {
   return m ? Date.parse(m[1]) : NaN
 }
 
+// LEDGER_REPORTED finds what a client reported: POST /v1/magpie/usage/requests
+// (#1874) appends a client's own calls to the same ledger, with the time the
+// client gives them, and a past time is kept on purpose so history can be
+// backfilled (docs/integrating.md). Such a row is written at the end of the
+// file and dated anywhere, so it says nothing about where the file's own
+// records have got to — magpie's index leaves it out of firstOwn for the same
+// reason (log_index.go). It never carries providerAccount, being not in
+// ingestFields, so it is never a row of this account either.
+const LEDGER_REPORTED = /"source"\s*:\s*"reported"/
+
+// rowReported is whether a line is one a client reported rather than one
+// magpie wrote when it happened.
+function rowReported(line) {
+  return LEDGER_REPORTED.test(line)
+}
+
 // rowAccount is the account a line was written under, or null when the line
 // names none (another record, or one cut short).
 function rowAccount(line) {
@@ -1703,7 +1719,6 @@ function readLedgerTail(path, st, now, chunks, account) {
     let stop = false
     let chain = [] // this account's own rows read, latest first
     let reach = 0 // the row below which nothing is kept: 0 until an edge is found
-    let latest = 0 // the newest of this account's rows read
     let answered = false // whether an answered free-model row of it is read
 
     while (pos > 0 && !stop) {
@@ -1718,29 +1733,22 @@ function readLedgerTail(path, st, now, chunks, account) {
         const line = lines[i]
         if (!line.trim()) continue
         const t = rowTime(line)
-        // Under the edge the read stops at, by time alone: nothing below it
-        // is kept, whatever wrote it.
-        if (reach && Number.isFinite(t) && t < reach) {
+        // Under an edge or the bound, by time alone: nothing below it can be
+        // kept, whatever wrote it — but a line a client reported is dated
+        // where the client's call happened, not where the file has got to.
+        const dated = Number.isFinite(t) && !rowReported(line)
+        if (dated && reach && t < reach) {
           stop = true
           break
         }
-        // A day under the newest row of this account's the read has found, or
-        // under now when it has found none yet, with nothing of its answered
-        // and no edge in reach: no window is being spent now, and what is
-        // here is older than the one that would have lapsed — it cannot open
-        // one either.
-        if (!reach && !answered && Number.isFinite(t) && t < lapsed) {
+        // A day back with nothing of this account's answered and no edge in
+        // reach: no window is being spent now, and nothing below can open one
+        if (dated && !reach && !answered && t < lapsed) {
           stop = true
           break
         }
-        // Another provider's or another account's line: its time is all this
-        // needs. A day under the newest of this account's rows, with nothing
-        // answered since, and no row above can open a window now — and what
-        // is below is older still.
-        if (!line.includes(account) || rowAccount(line) !== account) {
-          if (!reach && !answered && latest && latest < lapsed) stop = true
-          continue
-        }
+        // Another provider's or another account's line: nothing else to see
+        if (!line.includes(account) || rowAccount(line) !== account) continue
         let row
         try {
           row = JSON.parse(line)
@@ -1753,16 +1761,8 @@ function readLedgerTail(path, st, now, chunks, account) {
         if (!ofAccount(row, account)) continue
         rev.push(row)
         chain.push(row)
-        if (!Number.isFinite(t)) continue
-        // the account's newest row, wherever the read has got to: rows come
-        // newest first, so the first of them is it
-        if (!latest || t > latest) latest = t
         if (Number(row.status) === 200) answered = true
         if (!reach && Number(row.status) !== 429) reach = pinned(chain, account)
-        // The window has lapsed and nothing below here opens one: the newest
-        // of this account's rows is a day old and no request was answered
-        // since, so there is no window to report and none to read for.
-        if (!reach && !answered && latest < lapsed) stop = true
       }
       firstPass = false
     }
@@ -1786,25 +1786,22 @@ function readLedgerTail(path, st, now, chunks, account) {
 }
 
 // pinned is where the chain of account's own rows (latest first) is read
-// from: the time below which nothing is kept, Infinity when only the file's
-// start is. 0 while the rows say nothing about it yet.
+// from: the time below which nothing is kept. 0 while the rows say nothing
+// about it yet, and the read then goes to the file's start.
 //
-// The two edges are the ones the ledger spells out: a refusal whose reset can
-// be read, and a day's gap between two of this account's answered rows. With
-// neither read, the chain decides nothing — it goes back to the file's start,
-// where it is the whole ledger.
+// A row whose time cannot be read is passed over rather than ending the
+// chain there: one corrupt line used to cut it wherever it sat.
 function pinned(rows, account) {
   const at = (r) => Date.parse(r?.t)
   const apart = (a, b) => a - b >= FREE_WINDOW_GAP
-  const newest = at(rows[0])
-  if (!Number.isFinite(newest)) return Infinity
   // the earliest refusal read names where a window ended; the next request
   // opened another
+  let denied = null
   for (let i = rows.length - 1; i >= 0; i--) {
-    if (Number(rows[i]?.status) !== 429) continue
-    const reset = windowReset(rows[i].err)
-    if (Number.isFinite(reset) && reset < newest) return reset - FREE_WINDOW_LEAD
+    const reset = Number(rows[i]?.status) === 429 ? windowReset(rows[i].err) : NaN
+    if (Number.isFinite(reset)) denied = reset
   }
+  if (denied !== null) return denied - FREE_WINDOW_LEAD
   // A day's gap between two answered rows ended every window before it, and
   // the day before the later row is where the span's reading of the rows
   // above it begins. The rows come latest first, so each is compared with the
@@ -1813,7 +1810,7 @@ function pinned(rows, account) {
   for (let i = rows.length - 1; i >= 0; i--) {
     const r = rows[i]
     const t = at(r)
-    if (!Number.isFinite(t)) return Infinity
+    if (!Number.isFinite(t)) continue
     if (Number(r.status) !== 200) continue
     if (later === null) {
       later = t
@@ -1826,6 +1823,7 @@ function pinned(rows, account) {
   // the whole ledger — the only place a chain needs nothing before it
   return 0
 }
+
 
 // _internal is where these are handed to a test: magpie's host calls every
 // exported function of a plugin as one of its own factories (host.js,

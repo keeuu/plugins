@@ -237,7 +237,10 @@ What is measured, and what is easy to read wrongly:
     line's time is read before the line is decoded, so a line under the edge
     (of any provider or account) ends the read at once; and a read past 24h
     with no answered free-model row of this account stops, since the window
-    has lapsed and nothing would be reported.
+    has lapsed and nothing would be reported. Both bounds leave out a line
+    a client reported (`"source":"reported"`, #1874): magpie appends those
+    dated where the client's call happened, so a backfilled row says nothing
+    about where the file has got to.
   - `providerAccount` is the account's label. Two accounts sharing a label
     get its slot added (`pluginLabels`), the label no longer matches what
     their rows were written under, and the card reports no free window.
