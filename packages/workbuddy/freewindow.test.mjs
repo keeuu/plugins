@@ -510,3 +510,49 @@ test("the read of an account's own rows still stops", () => {
     rmSync(root, { recursive: true, force: true })
   }
 })
+
+// Two refusals in one chain: the oldest names a window that ended long ago and
+// whose reset is behind us, the newest names one still running. pinned walks
+// the rows oldest to newest and overwrites, so the newest refusal wins — it is
+// nearer to now and its reset is the tighter bound on where the chain can be
+// read from. The old `reset < newest` guard is gone; this pins what replaced it.
+test("of two refusals in the chain, the newest one pins the read", () => {
+  const now = at("2026-10-22T12:00:00+08:00")
+  const at8 = (h) => `${new Date(now - h * AN_HOUR).toISOString().slice(0, 19).replace("T", " ")} UTC+8`
+  const refusalAt = (h, reset) => row(new Date(now - h * AN_HOUR).toISOString(), { status: 429, err: `${TIMEOUT_BEFORE_RESET}${reset}, alternatively, you can switch to the other models to continue using it.` })
+  // an old refusal whose reset lapsed 2 days ago, then a live one 6h back
+  const old = refusalAt(54, at8(30))
+  const live = refusalAt(6, at8(-18))
+  const rows = [old, ...spread(now - 54 * AN_HOUR + AN_HOUR, now - 7 * AN_HOUR), live].sort((a, b) => Date.parse(a.t) - Date.parse(b.t))
+  expect(rows.at(-1)).toBe(live)
+  // pinned's contract: latest first
+  const got = _internal.pinned([...rows].reverse(), "me@example.com")
+  const liveReset = at(at8(-18).replace(" UTC+8", "+08:00"))
+  const oldReset = at(at8(30).replace(" UTC+8", "+08:00"))
+  expect(got).toBe(liveReset - 86400_000)
+  expect(got).not.toBe(oldReset - 86400_000)
+})
+
+// One unreadable row in the middle of the chain: pinned passes over it rather
+// than ending the chain at it, so the bound is the same as the whole chain's.
+// Swap `if (!Number.isFinite(t)) continue` back to `return Infinity` and this
+// fails: the corrupt row becomes the bound, and the read would go back to the
+// file's start instead of stopping where the clean chain stops.
+test("a row whose time cannot be read is passed over", () => {
+  const now = at("2026-10-22T12:00:00+08:00")
+  // hourly for 100h, then nothing until 20h ago, then hourly: two runs a day
+  // or more apart, so the row after the second gap pins the chain
+  const clean = spread(now - 100 * AN_HOUR, now - 50 * AN_HOUR).concat(spread(now - 20 * AN_HOUR, now))
+  const latestFirst = [...clean].sort((a, b) => Date.parse(b.t) - Date.parse(a.t))
+  const bound = _internal.pinned(latestFirst, "me@example.com")
+  // a real bound, not the "no edge, read from the start" 0: walked oldest to
+  // newest, the first day-wide gap is the one before the 50h row, and that is
+  // where the chain can first be read from
+  expect(bound).not.toBe(0)
+  expect(bound).toBe(now - 50 * AN_HOUR - A_DAY)
+  // the same chain with one row in its middle carrying no readable t
+  const holey = latestFirst.map((r) => (Date.parse(r.t) === now - 60 * AN_HOUR ? { ...r, t: "not-a-time" } : r))
+  expect(holey.some((r) => r.t === "not-a-time")).toBe(true)
+  // the same bound, not Infinity and not the 0 of a chain with no edge
+  expect(_internal.pinned(holey, "me@example.com")).toBe(bound)
+})

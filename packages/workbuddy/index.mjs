@@ -2105,8 +2105,14 @@ function readLedgerTail(path, st, now, chunks, account) {
 function pinned(rows, account) {
   const at = (r) => Date.parse(r?.t)
   const apart = (a, b) => a - b >= FREE_WINDOW_GAP
-  // the earliest refusal read names where a window ended; the next request
-  // opened another
+  // A refusal names where a window ended, and the next request opened
+  // another. The loop walks oldest to newest and overwrites `denied`, so the
+  // one kept is the *newest* readable refusal in the chain, not the earliest:
+  // a later refusal is nearer to now, and its reset is the tighter bound on
+  // where the chain can be read from. A refusal whose reset has already been
+  // passed by a newer one therefore loses, which is what we want — the old
+  // `reset < newest` test that used to guard this is gone, the overwrite does
+  // the same job and keeps the latest.
   let denied = null
   for (let i = rows.length - 1; i >= 0; i--) {
     const reset = Number(rows[i]?.status) === 429 ? windowReset(rows[i].err) : NaN
@@ -2134,7 +2140,6 @@ function pinned(rows, account) {
   // the whole ledger — the only place a chain needs nothing before it
   return 0
 }
-
 
 // _internal is where these are handed to a test: magpie's host calls every
 // exported function of a plugin as one of its own factories (host.js,
@@ -2846,4 +2851,4 @@ export const WorkBuddyAuthPlugin = makePlugin(SITES.workbuddy)
 export const WorkBuddyAIAuthPlugin = makePlugin(SITES["workbuddy-ai"])
 
 // for tests
-export const _internal = { typeUnions, systemAsUser, systemKey, DEFAULT_SYSTEM, EDGE_READS, fitShape, replyAfterTools, AFTER_TOOLS_REFUSED, enterpriseUsageOf, notDesktop, textOnly, runsOutOf, packagesOf, endOf, enterpriseHeaders, enterpriseOf, liveModels, browserSignIn, withSystem, normalizeToolChoice, fitTools, fitted, renamed, unflagged, usageOf, desktopHeld, explained, REFUSED_HINT, RESTRICTED_HINT, EXHAUSTED_HINT, freeCredits, creditsOf, priceOf, fresh, SITES, renewing, renewed, SESSION, attend, turnKey, conversationKey, signatureOf, isMessages, withoutUnsigned, withoutSignedThinking, answeredBefore, nativeOf, modelOf, configModels, freeWindowOf, tokensShort, freeWindowRows, freeWindowLedger, readLedgerTail, pinned, rowTime, rowAccount, ofAccount, windowOffset, windowReset, FREE_WINDOW_MODELS, FREE_WINDOW_KEEP, FREE_WINDOW_SPAN, FREE_WINDOW_GAP, FREE_WINDOW_LEAD, API_MESSAGES: NPM_MESSAGES, API_CHAT: NPM }
+export const _internal = { typeUnions, systemAsUser, systemKey, DEFAULT_SYSTEM, EDGE_READS, fitShape, replyAfterTools, AFTER_TOOLS_REFUSED, enterpriseUsageOf, notDesktop, textOnly, runsOutOf, packagesOf, endOf, enterpriseHeaders, enterpriseOf, liveModels, browserSignIn, withSystem, normalizeToolChoice, fitTools, fitted, renamed, unflagged, usageOf, desktopHeld, explained, REFUSED_HINT, RESTRICTED_HINT, EXHAUSTED_HINT, freeCredits, creditsOf, priceOf, fresh, SITES, renewing, renewed, SESSION, attend, turnKey, conversationKey, signatureOf, isMessages, withoutUnsigned, withoutSignedThinking, answeredBefore, nativeOf, modelOf, configModels, freeWindowOf, tokensShort, freeWindowRows, freeWindowLedger, readLedgerTail, pinned, rowTime, rowAccount, ofAccount, windowOffset, windowReset, FREE_WINDOW_MODELS, FREE_WINDOW_SPAN, FREE_WINDOW_GAP, FREE_WINDOW_LEAD, API_MESSAGES: NPM_MESSAGES, API_CHAT: NPM }
