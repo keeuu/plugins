@@ -36,7 +36,7 @@ The adapter does not reload a busy Work runtime. If Kimi independently changes i
 - `~/.config/magpie-kimi/status.json`: fixed status categories, without credentials.
 - `~/.config/magpie-kimi/adapter-state.json`: original service address and connection ownership; no Kimi login credentials.
 - `~/.config/magpie-kimi/before-menu-models.json`: one snapshot of the original model list/current choice, removed after a clean disconnect. No full configuration or credential backup is written.
-- Kimi configuration: `kimi-desktop/daimon-share/daimon/config.json` under the platform's application-support directory.
+- Kimi configuration: `daimon/config.json` in Kimi's `daimon-share` folder: where `kimi-desktop/daimon-storage.json` points (`shareDir`; Kimi 3.2.21 on Windows writes it when installed on another drive, e.g. `D:\KimiData\daimon-share`, and on any system when its storage is moved), else `kimi-desktop/daimon-share`, under the platform's application-support directory (`%APPDATA%`, `~/Library/Application Support`, `~/.config`).
 
 Verified with Windows 11, Kimi 3.2.17.10 and official Magpie 0.1.1275, including an actual Work request through Magpie. The [macOS record](COMPATIBILITY.md) verifies real control methods, connect/disconnect restoration and a real streamed bridge request on macOS 26.6.2 arm64, Kimi 3.2.17 build 3.2.17.4 and official Magpie 0.1.1276. That request was initiated by an HTTP test client; a macOS desktop UI-submitted Work turn remains unverified. The supported runtime has provider `daimon-kimi-code` with original service `https://agent-gw.kimi.com/coding/v1`; other layouts stop with `unsupported_kimi_config`.
 

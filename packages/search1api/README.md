@@ -39,6 +39,13 @@ access, then return to Magpie. The plugin uses a dynamically registered public
 OAuth client, authorization code flow with PKCE S256, and a temporary loopback
 callback. No client secret or Search1API CLI is required.
 
+The client is registered once and saved, with its callback port, in
+`search1api-oauth-client.json` next to `plugin-auth.json`; later sign-ins
+reuse it. If that port is busy, or a sign-in with the saved client does not
+finish, the plugin registers a new client. The authorization URL carries
+`utm_source=magpie` and API requests send `User-Agent: search1api-magpie/<version>`,
+so Search1API can tell sign-ups and usage that come from Magpie.
+
 The browser must run on the same computer as Magpie. For a remote or container
 installation, use an API key instead. The callback expires after five minutes.
 
@@ -71,7 +78,7 @@ magpie plugin login search1api api
 ```
 
 Magpie prompts privately for the key and saves it in its credential store.
-Get a key at [s1.dev](https://s1.dev/).
+Get a key at [s1.dev](https://s1.dev/?utm_source=magpie&utm_medium=readme).
 
 For automated deployments, the plugin also accepts an `apiKey` plugin option
 in Magpie's options editor, or `SEARCH1API_API_KEY` in the environment of the
@@ -122,8 +129,14 @@ your Magpie tools endpoint.
 - `crawl`: retrieve readable page content.
 - `sitemap`: discover site links.
 - `trending`: GitHub or Hacker News trends.
+- `send_feedback`: report a wrong or empty result, an unresolved error,
+  mismatched docs or a missing capability to the Search1API team, through
+  Search1API's `POST /feedback` API. It is free and needs a Search1API sign-in or API key. The report (message,
+  intent, category, request id and model) goes only to Search1API, which stores
+  it in its feedback inbox on [Agentback](https://agentback.app), a
+  third-party host, linked to your Search1API account.
 
-Tool parameters follow the existing OpenCode integration. Search and news
+Search tool parameters follow the existing OpenCode integration. Search and news
 preserve optional `published_date` and per-result `metadata`; Ask preserves
 `intent`, `source`, `relevance`, and `errors`. Attribute Grokipedia results as
 “Powered by xAI”. Results are returned as JSON text.

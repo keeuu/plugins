@@ -17,6 +17,7 @@ test("all six tools forward arguments to the API and preserve result metadata", 
     "crawl",
     "sitemap",
     "trending",
+    "send_feedback",
   ]);
   const cases = [
     [

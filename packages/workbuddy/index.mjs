@@ -6,15 +6,16 @@
 // the token as WorkBuddy's desktop app does) or is taken from WorkBuddy
 // desktop's own sign-in. Its chats are chat completions at <endpoint>/v2,
 // streamed only, with WorkBuddy's headers: a request whose User-Agent isn't
-// WorkBuddy/<version> is refused (error 10085).
+// WorkBuddy/<version> is refused (error 10085). Each build's headers are
+// those of its current desktop app (see SITES' app, cli and appName).
 
 import { createHash, randomBytes } from "node:crypto"
 import { closeSync, openSync, readFileSync, readSync, statSync } from "node:fs"
 import { homedir } from "node:os"
 import { isAbsolute, join } from "node:path"
+import { gzipSync } from "node:zlib"
 
 const APP_VERSION = "2.0.0" // the version WorkBuddy's sign-in page is opened with
-const UA_VERSION = "5.5.6" // WorkBuddy/<this> is the User-Agent the API takes
 const POLL_MS = 1000
 const SIGN_IN_MS = 5 * 60 * 1000
 const EARLY_MS = 60 * 1000 // a token this close to its end is refreshed before a request
@@ -67,6 +68,18 @@ const SITES = {
     authID: "workbuddy-desktop",
     platform: "workbuddy",
     ai: false,
+    // the desktop app the requests are WorkBuddy's own client's of: its
+    // version, its bundled CLI's (@genie/agent-cli), and the CLI's
+    // product.json applicationName. Read from WorkBuddy 5.9.3.42398134,
+    // the update feed's current build on 2026-10-28.
+    app: "5.9.3",
+    cli: "2.165.0",
+    appName: "WorkBuddy",
+    // 5.9's CLI says on each chat where the agent runs; the desktop's own
+    // is "local-agent" (X-Agent-Runtime, absent in 5.8)
+    runtime: "local-agent",
+    // where this build's API keys are made (see keyAccount)
+    keys: "https://www.workbuddy.cn/profile/keys",
     models: CN_MODELS,
     // it serves the Claude models on Anthropic's Messages API too (see
     // nativeOf)
@@ -79,6 +92,16 @@ const SITES = {
     authID: "workbuddy-desktop-ai",
     platform: "workbuddy-ai",
     ai: true,
+    // WorkBuddy AI 5.9.3.42398134, its update feed's current build on
+    // 2026-10-29 (see the China build's): the same CLI as the China
+    // build's 5.9.3, byte for byte but for product.json, and the same
+    // Electron (37.10.3); its desktop puts agentRuntime local-agent in the
+    // prompt meta as the China build's does
+    app: "5.9.3",
+    cli: "2.165.0",
+    appName: "workbuddy-ai",
+    runtime: "local-agent",
+    keys: "https://www.workbuddy.ai/profile/keys",
     models: AI_MODELS,
     // models whose images WorkBuddy AI drops though its config says they
     // take them (see textOnly)
@@ -152,7 +175,7 @@ async function call(site, method, path, headers = {}, body) {
     headers: {
       "Content-Type": "application/json",
       Accept: "application/json",
-      "User-Agent": "WorkBuddy/" + UA_VERSION,
+      "User-Agent": "WorkBuddy/" + site.app,
       ...headers,
     },
     body: body === undefined ? undefined : JSON.stringify(body),
@@ -299,19 +322,87 @@ async function refreshed(site, auth) {
 function sign(site, a, headers) {
   headers.set("Authorization", "Bearer " + a.access)
   headers.set("X-User-Id", a.uid ?? "")
-  headers.set("X-Domain", domainOf(site, a))
+  if (a.source === "key") {
+    // the key's own header, and no X-Domain: a key's session has none
+    headers.set("X-API-Key", a.key)
+    headers.delete("X-Domain")
+  } else {
+    headers.delete("X-API-Key")
+    headers.set("X-Domain", domainOf(site, a))
+  }
   headers.set("X-Product", "SaaS")
   headers.set("X-IDE-Type", "WorkBuddy")
-  headers.set("User-Agent", "WorkBuddy/" + UA_VERSION)
+  headers.set("User-Agent", cliAgent(site))
   headers.set("X-Requested-With", "XMLHttpRequest")
   headers.set("X-Agent-Intent", "craft")
   headers.set("X-Agent-Purpose", "conversation")
   headers.set("X-IDE-Name", "WorkBuddy")
-  headers.set("X-IDE-Version", UA_VERSION)
+  headers.set("X-IDE-Version", site.app)
   for (const [k, v] of Object.entries(enterpriseHeaders(a))) headers.set(k, v)
-  if (!site.ai) return
-  headers.set("X-Agent-Type", "main")
 }
+
+// cliAgent is the User-Agent WorkBuddy's desktop CLI sends its API calls
+// (a chat, the product config) with: UserAgentHttpInterceptor's
+// buildUserAgent puts the platform (CLIENT_INFO_PLATFORM "WorkBuddy", at
+// the app's version) first, then the CLI's applicationName at the same
+// version, then CLIENT_INFO_USER_AGENT_EXTENSION, "CLI/<its version>".
+function cliAgent(site) {
+  return `WorkBuddy/${site.app} ${site.appName}/${site.app} CLI/${site.cli}`
+}
+
+// OPENAI_SDK and NODE are what the CLI's chats go out through: the OpenAI
+// SDK it bundles (openai 6.25.0) and the Node its Electron runs it on
+// (Electron 37.10.3, ELECTRON_RUN_AS_NODE).
+const OPENAI_SDK = "6.25.0"
+const NODE = "v22.21.1"
+const SDK_OS = { darwin: "MacOS", win32: "Windows", linux: "Linux", freebsd: "FreeBSD", openbsd: "OpenBSD", android: "Android" }
+const SDK_ARCH = { x64: "x64", arm64: "arm64", arm: "arm", ia32: "x32", x32: "x32" }
+
+// chatHeaders sets on a chat what WorkBuddy's CLI adds to its model
+// requests alone (axiosToFetchAdapter, both builds): the agent type
+// (resolveModelCallAgentType, "main" for the conversation's own agent),
+// the runtime where a build sends one, and the OpenAI SDK's own headers,
+// which the CLI's fetch passes on. Its client has a 1200s timeout and
+// no retries of its own.
+function chatHeaders(site, headers) {
+  headers.set("X-Agent-Type", "main")
+  if (site.runtime) headers.set("X-Agent-Runtime", site.runtime)
+  else headers.delete("X-Agent-Runtime")
+  headers.set("Accept", "application/json")
+  headers.set("X-Stainless-Retry-Count", "0")
+  headers.set("X-Stainless-Timeout", "1200")
+  headers.set("X-Stainless-Lang", "js")
+  headers.set("X-Stainless-Package-Version", OPENAI_SDK)
+  headers.set("X-Stainless-OS", SDK_OS[process.platform] ?? (process.platform ? `Other:${process.platform}` : "Unknown"))
+  headers.set("X-Stainless-Arch", SDK_ARCH[process.arch] ?? (process.arch ? `other:${process.arch}` : "unknown"))
+  headers.set("X-Stainless-Runtime", "node")
+  headers.set("X-Stainless-Runtime-Version", NODE)
+}
+
+// keyAccount is the account an API key (OpenCode's {type: "api", key}) is
+// sent as, the way WorkBuddy's own CLI sends one (@tencent-ai/codebuddy-code
+// 2.177.0, CODEBUDDY_API_KEY): its API-key sign-in is a session whose access
+// token is the key and whose uid is "anonymous_" and the key's last eight
+// characters (ACC_USER_ID unset), personal, with no domain and no
+// enterprise; and its model requests carry the key twice, X-API-Key and
+// Authorization: Bearer (getCustomHeaders). Its requests go to the build's
+// own host, the one its other sign-ins use: for the China build that is
+// copilot.tencent.com, the CLI's own endpoint for that build
+// (CODEBUDDY_INTERNET_ENVIRONMENT=internal, product.internal.json), and the
+// same API as www.workbuddy.cn, where the keys are made (the CLI's
+// CN_SAAS_CORE_API_FRONT_DOORS); for the international build,
+// www.workbuddy.ai (the CLI's own default, www.codebuddy.ai, is CodeBuddy's,
+// not WorkBuddy's). Nothing renews a key.
+function keyAccount(auth) {
+  const key = typeof auth?.key === "string" ? auth.key.trim() : ""
+  if (!key) return null
+  return { key, access: key, uid: "anonymous_" + key.slice(-8), source: "key" }
+}
+
+// remoteConfig says whether WorkBuddy's own CLI asks /v3/config for the
+// account's models with this key: only for keys that start ck_ or pt_
+// (shouldLoadRemoteConfig); any other key keeps the built-in list.
+const remoteConfig = (key) => /^(ck_|pt_)/.test(key)
 
 // enterpriseHeaders names the enterprise (team) an account signed in as, as
 // WorkBuddy's own client does on every request it makes for that account
@@ -355,7 +446,7 @@ async function enterpriseOf(site, a, who) {
 // itself, and the request that carried it. Its backend counts a user send as
 // one request by X-Conversation-Request-ID: a chat carrying a new one every
 // time is counted on its own, so one send that takes several steps — a tool
-// call answered and sent again, a retry, another account answering — shows up
+// call answered and sent again, a retry — shows up
 // in the usage detail as many requests. The ids below are made from what
 // names the conversation and the turn, so every step of one send carries the
 // same turn id and the user's next message carries another, as WorkBuddy's
@@ -372,8 +463,28 @@ const SALT = randomBytes(16).toString("hex")
 
 // idFor is the 32 hex digits WorkBuddy's own ids are made of, made of a
 // name of the thing the id is for (a turn, a conversation) and what names it.
+// key is a string, or the pieces it is made of: the digest is the same
+// either way, and a key made of a 45 MiB message is never joined into one
+// string to be hashed (plugins#461). Each piece goes to the hash whole:
+// Bun reads a one-byte string's bytes in place, where a piece cut into
+// slices was measured costing a copy of each slice.
 function idFor(kind, key) {
-  return createHash("sha256").update(`${SALT}|${kind}|${key}`).digest("hex").slice(0, 32)
+  const h = createHash("sha256").update(`${SALT}|${kind}|`)
+  // a surrogate pair's first half ending one piece waits for the next, as
+  // the joined key would hold the pair together
+  let held = ""
+  for (let piece of typeof key === "string" ? [key] : key) {
+    if (held) piece = held + piece
+    held = ""
+    const c = piece.charCodeAt(piece.length - 1)
+    if (c >= 0xd800 && c <= 0xdbff) {
+      held = piece.slice(-1)
+      piece = piece.slice(0, -1)
+    }
+    h.update(piece)
+  }
+  if (held) h.update(held)
+  return h.digest("hex").slice(0, 32)
 }
 
 // signatureOf is a message content's signature: its text, and a digest of
@@ -382,14 +493,20 @@ function idFor(kind, key) {
 // clients of Anthropic's shape — is left out: it is not what the user said,
 // and it changes with every step of the send.
 function signatureOf(content) {
-  if (typeof content === "string") return content
-  if (!Array.isArray(content)) return ""
-  let out = ""
+  return signatureParts(content).join("")
+}
+
+// signatureParts is signatureOf in the pieces it is joined from, none empty
+function signatureParts(content) {
+  if (typeof content === "string") return content ? [content] : []
+  if (!Array.isArray(content)) return []
+  const out = []
   for (const part of content) {
     const type = part?.type ?? ""
-    if (type === "" || type === "text") out += typeof part?.text === "string" ? part.text : ""
-    else if (type !== "tool_result" && type !== "tool-result") {
-      out += `[${type}:${createHash("sha256").update(JSON.stringify(part)).digest("hex").slice(0, 8)}]`
+    if (type === "" || type === "text") {
+      if (typeof part?.text === "string" && part.text) out.push(part.text)
+    } else if (type !== "tool_result" && type !== "tool-result") {
+      out.push(`[${type}:${createHash("sha256").update(JSON.stringify(part)).digest("hex").slice(0, 8)}]`)
     }
   }
   return out
@@ -435,13 +552,18 @@ function hasBlock(m, type) {
 // has none at all: the caller then makes a fresh id for that request, as
 // before these were derived at all.
 function turnKey(chat) {
+  return turnParts(chat).join("")
+}
+
+// turnParts is turnKey in pieces (idFor takes them): [] for ""
+function turnParts(chat) {
   const msgs = Array.isArray(chat?.messages) ? chat.messages : []
   for (let i = msgs.length - 1; i >= 0; i--) {
     if (msgs[i]?.role !== "user" || answeredBefore(msgs, i)) continue
-    const sig = signatureOf(msgs[i].content)
-    return sig ? `u${i}:${sig}` : ""
+    const sig = signatureParts(msgs[i].content)
+    return sig.length ? [`u${i}:`, ...sig] : []
   }
-  return ""
+  return []
 }
 
 // conversationKey names the conversation a chat belongs to: the session
@@ -451,14 +573,19 @@ function turnKey(chat) {
 // conversation id is sent then: a made-up one would be a conversation of the
 // request's own, which is what fragments the usage detail in the first place.
 function conversationKey(chat, session) {
-  if (session) return `session:${session}`
+  return conversationParts(chat, session).join("")
+}
+
+// conversationParts is conversationKey in pieces (idFor takes them): [] for ""
+function conversationParts(chat, session) {
+  if (session) return [`session:${session}`]
   const msgs = Array.isArray(chat?.messages) ? chat.messages : []
   for (const m of msgs) {
     if (m?.role !== "user") continue
-    const sig = signatureOf(m.content)
-    if (sig) return `first:${sig}`
+    const sig = signatureParts(m.content)
+    if (sig.length) return ["first:", ...sig]
   }
-  return ""
+  return []
 }
 
 // isMessages says whether a request is an Anthropic Messages one, which
@@ -522,8 +649,13 @@ function isMessages(url, body) {
 // unsigned thinking is body itself, byte for byte.
 function withoutUnsigned(body) {
   const b = chatOf(body)
+  return unsignedOn(b) ? JSON.stringify(b) : body
+}
+
+// unsignedOn makes withoutUnsigned's change to a body's object; true when it made one
+function unsignedOn(b) {
   const msgs = b?.messages
-  if (!Array.isArray(msgs)) return body
+  if (!Array.isArray(msgs)) return false
   let changed = false
   for (const m of msgs) {
     if (m?.role !== "assistant" || !Array.isArray(m.content)) continue
@@ -532,7 +664,7 @@ function withoutUnsigned(body) {
     changed = true
     m.content = kept.length ? kept : [{ type: "text", text: "" }]
   }
-  return changed ? JSON.stringify(b) : body
+  return changed
 }
 
 // withoutSignedThinking is a Messages body without any thinking block at
@@ -557,6 +689,12 @@ function withoutSignedThinking(body) {
 
 // chatOf is a chat's body as the object it is, null for one that isn't: a
 // body that isn't text (bytes), or isn't JSON at all.
+// bodyString is a body given as bytes, as text; anything else is null.
+function bodyString(body) {
+  if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) return new TextDecoder().decode(body)
+  return null
+}
+
 function chatOf(body) {
   if (typeof body !== "string") return null
   try {
@@ -581,19 +719,64 @@ function sessionOf(headers) {
 // turn's (one user send, whatever it takes), and the conversation's. A header
 // already there — the caller's own, or another plugin's — is kept, and the
 // message and request ids are the same one, as WorkBuddy's client has them.
-function attend(headers, body, session) {
-  const chat = chatOf(body)
-  const conv = conversationKey(chat, session)
+//
+// who is the account the chat goes as (scopeOf). The ids are that account's
+// own: WorkBuddy's client runs as one account, so one conversation or turn
+// never shows up under two. Without it, one magpie session spread over a
+// group of accounts sent the same X-Conversation-ID and
+// X-Conversation-Request-ID under every account's X-User-Id.
+function attend(headers, body, session, who = "") {
+  return attendChat(headers, chatOf(body), session, who)
+}
+
+// attendChat is attend with the chat read already. It returns what reattend
+// needs to set the ids again for another account once the chat itself is
+// let go: the ids it set itself (not the caller's), and the digests of what
+// names the turn and the conversation, which are never sent as they are.
+function attendChat(headers, chat, session, who = "") {
+  const conv = conversationParts(chat, session)
+  const turn = turnParts(chat)
+  const ids = {
+    set: [],
+    // a turn is a conversation's own: two conversations whose user message
+    // reads the same are still two sends, not one
+    turn: turn.length ? idFor("turn", [...conv, "|", ...turn]) : "",
+    conv: conv.length ? idFor("conversation", conv) : "",
+  }
+  return setIds(headers, ids, who)
+}
+
+// setIds sets the message's id, and the turn's and conversation's for the
+// account who, where the caller set none.
+function setIds(headers, ids, who) {
   const msg = hex()
   headers.set("X-Conversation-Message-ID", msg)
   headers.set("X-Request-ID", msg)
+  const set = []
+  const own = (kind, base) => (who ? idFor(kind, [`account:${who}`, "|", base]) : base)
   if (!headers.has("X-Conversation-Request-ID")) {
-    const turn = turnKey(chat)
-    // a turn is a conversation's own: two conversations whose user message
-    // reads the same are still two sends, not one
-    headers.set("X-Conversation-Request-ID", turn ? idFor("turn", `${conv}|${turn}`) : hex())
+    headers.set("X-Conversation-Request-ID", ids.turn ? own("turn", ids.turn) : hex())
+    set.push("X-Conversation-Request-ID")
   }
-  if (conv && !headers.has("X-Conversation-ID")) headers.set("X-Conversation-ID", idFor("conversation", conv))
+  if (ids.conv && !headers.has("X-Conversation-ID")) {
+    headers.set("X-Conversation-ID", own("conversation", ids.conv))
+    set.push("X-Conversation-ID")
+  }
+  return { ...ids, set }
+}
+
+// scopeOf names the account a chat goes as for attend: its uid, its
+// enterprise, and for a key account the key (only ever hashed).
+function scopeOf(a) {
+  return `${a?.uid ?? ""}|${a?.enterpriseId ?? ""}|${a?.source === "key" ? a.key ?? "" : ""}`
+}
+
+// reattend sets a chat's ids again for the account it is now sent as, when
+// that is another account than the one they were set for.
+function reattend(headers, ids, was, now) {
+  if (was === now) return ids
+  for (const h of ids.set) headers.delete(h)
+  return setIds(headers, ids, now)
 }
 
 // FLAGGED are the words WorkBuddy refuses a chat for, "Illegal API
@@ -664,32 +847,68 @@ function unflag(messages) {
 // OpenAI-compatible client normally uses max_completion_tokens and may call a
 // reasoning prompt developer; WorkBuddy's endpoint takes max_tokens and
 // system instead.
+// An earlier turn's thinking goes back as `reasoning`, the field WorkBuddy's
+// own client (CodeBuddy's agents converter) sets on an assistant message.
+// WorkBuddy drops `reasoning_content`, which Grok Build, DeepSeek-style
+// clients and magpie's own replies use: measured 2026-10-27 on
+// www.workbuddy.ai, a codeword in reasoning_content reached none of
+// kimi-k2.6, kimi-k3, glm-5.3, deepseek-v4.1-flash and minimax-m3, while
+// the same words as `reasoning` reached kimi-k2.6 and minimax-m3.
+// OpenRouter-style reasoning_details are read for their text the same way.
+function reasoningOf(m) {
+  if (typeof m.reasoning_content === "string" && m.reasoning_content) return m.reasoning_content
+  if (Array.isArray(m.reasoning_details)) {
+    const text = m.reasoning_details.map((d) => (typeof d?.text === "string" ? d.text : typeof d?.summary === "string" ? d.summary : "")).join("")
+    if (text) return text
+  }
+  return ""
+}
+
+function asReasoning(messages) {
+  let changed = false
+  for (const m of messages) {
+    if (m?.role !== "assistant" || (m.reasoning_content === undefined && m.reasoning_details === undefined)) continue
+    const text = reasoningOf(m)
+    if (text && !(typeof m.reasoning === "string" && m.reasoning)) m.reasoning = text
+    delete m.reasoning_content
+    delete m.reasoning_details
+    changed = true
+  }
+  return changed
+}
+
 function withSystem(body) {
   // a body magpie or OpenCode hands over as bytes is read as the text it is
   if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) body = new TextDecoder().decode(body)
   if (typeof body !== "string") return body
   try {
     const b = JSON.parse(body)
-    if (!Array.isArray(b?.messages) || !b.messages.length) return body
-    let changed = unflag(b.messages)
-    if (b.max_completion_tokens !== undefined) {
-      if (b.max_tokens === undefined) b.max_tokens = b.max_completion_tokens
-      delete b.max_completion_tokens
-      changed = true
-    }
-    for (const m of b.messages) {
-      if (m?.role !== "developer") continue
-      m.role = "system"
-      changed = true
-    }
-    if (b.messages[0]?.role !== "system") {
-      b.messages.unshift({ role: "system", content: "You are a helpful assistant." })
-      changed = true
-    }
-    return changed ? JSON.stringify(b) : body
+    return systemOn(b) ? JSON.stringify(b) : body
   } catch {
     return body
   }
+}
+
+// systemOn makes withSystem's changes to a chat's object; true when it made any
+function systemOn(b) {
+  if (!Array.isArray(b?.messages) || !b.messages.length) return false
+  let changed = unflag(b.messages)
+  if (b.max_completion_tokens !== undefined) {
+    if (b.max_tokens === undefined) b.max_tokens = b.max_completion_tokens
+    delete b.max_completion_tokens
+    changed = true
+  }
+  for (const m of b.messages) {
+    if (m?.role !== "developer") continue
+    m.role = "system"
+    changed = true
+  }
+  if (asReasoning(b.messages)) changed = true
+  if (b.messages[0]?.role !== "system") {
+    b.messages.unshift({ role: "system", content: "You are a helpful assistant." })
+    changed = true
+  }
+  return changed
 }
 
 // WorkBuddy's channel check reads the system and assistant messages only:
@@ -718,7 +937,11 @@ function textOf(content) {
 // systemKey is the text of a chat's system messages, which a chat refused
 // once is known by: the same agent's next chat goes with systemAsUser at once
 function systemKey(body) {
-  const msgs = chatOf(body)?.messages
+  return systemKeyOf(chatOf(body))
+}
+
+function systemKeyOf(chat) {
+  const msgs = chat?.messages
   if (!Array.isArray(msgs)) return ""
   const key = msgs.filter((m) => m?.role === "system").map((m) => textOf(m.content)).join("\n")
   return key.trim() === DEFAULT_SYSTEM ? "" : key
@@ -726,15 +949,21 @@ function systemKey(body) {
 
 function systemAsUser(body) {
   const b = chatOf(body)
+  return systemAsUserOn(b) ? JSON.stringify(b) : null
+}
+
+// systemAsUserOn makes systemAsUser's move on a chat's object; false when
+// there's nothing to move
+function systemAsUserOn(b) {
   const msgs = b?.messages
-  if (!Array.isArray(msgs)) return null
+  if (!Array.isArray(msgs)) return false
   let i = 0
   const lead = []
   for (; i < msgs.length && msgs[i]?.role === "system"; i++) lead.push(textOf(msgs[i].content))
   const said = lead.join("\n\n").trim()
   const rest = msgs.slice(i).map((m) => (m?.role === "system" ? { ...m, role: "user" } : m))
   const moved = said && said !== DEFAULT_SYSTEM
-  if (!moved && rest.every((m, k) => m === msgs[i + k])) return null
+  if (!moved && rest.every((m, k) => m === msgs[i + k])) return false
   if (moved) {
     const text = INSTRUCTIONS[0] + said + INSTRUCTIONS[1]
     const u = rest.findIndex((m) => m?.role === "user")
@@ -744,7 +973,7 @@ function systemAsUser(body) {
     else rest[u] = { ...rest[u], content: text }
   }
   b.messages = [{ role: "system", content: DEFAULT_SYSTEM }, ...rest]
-  return JSON.stringify(b)
+  return true
 }
 
 // normalizeToolChoice converts the object form emitted by OpenAI clients to
@@ -754,40 +983,45 @@ function normalizeToolChoice(body) {
   if (typeof body !== "string") return body
   try {
     const b = JSON.parse(body)
-    if (!b || typeof b !== "object" || Array.isArray(b) || !("tool_choice" in b)) return body
-    const choice = b.tool_choice
-    if (typeof choice === "string") {
-      if (choice.trim().toLowerCase() === "none") {
-        delete b.tool_choice
-        delete b.tools
-        delete b.functions
-      }
-      return JSON.stringify(b)
-    }
-    if (!choice || typeof choice !== "object" || Array.isArray(choice)) {
-      delete b.tool_choice
-      return JSON.stringify(b)
-    }
-    const type = typeof choice.type === "string" ? choice.type.trim().toLowerCase() : ""
-    if (type === "none") {
-      delete b.tool_choice
-      delete b.tools
-      delete b.functions
-    } else if (type === "auto" || type === "required") {
-      b.tool_choice = type
-    } else if (type === "function") {
-      const fn = choice.function && typeof choice.function === "object" && !Array.isArray(choice.function)
-        ? choice.function
-        : undefined
-      const name = typeof fn?.name === "string" ? fn.name.trim() : ""
-      b.tool_choice = name || "auto"
-    } else {
-      delete b.tool_choice
-    }
-    return JSON.stringify(b)
+    return toolChoiceOn(b) ? JSON.stringify(b) : body
   } catch {
     return body
   }
+}
+
+// toolChoiceOn makes normalizeToolChoice's change to a chat's object; true
+// when it made one (a string choice other than none is WorkBuddy's already)
+function toolChoiceOn(b) {
+  if (!b || typeof b !== "object" || Array.isArray(b) || !("tool_choice" in b)) return false
+  const choice = b.tool_choice
+  if (typeof choice === "string") {
+    if (choice.trim().toLowerCase() !== "none") return false
+    delete b.tool_choice
+    delete b.tools
+    delete b.functions
+    return true
+  }
+  if (!choice || typeof choice !== "object" || Array.isArray(choice)) {
+    delete b.tool_choice
+    return true
+  }
+  const type = typeof choice.type === "string" ? choice.type.trim().toLowerCase() : ""
+  if (type === "none") {
+    delete b.tool_choice
+    delete b.tools
+    delete b.functions
+  } else if (type === "auto" || type === "required") {
+    b.tool_choice = type
+  } else if (type === "function") {
+    const fn = choice.function && typeof choice.function === "object" && !Array.isArray(choice.function)
+      ? choice.function
+      : undefined
+    const name = typeof fn?.name === "string" ? fn.name.trim() : ""
+    b.tool_choice = name || "auto"
+  } else {
+    delete b.tool_choice
+  }
+  return true
 }
 
 // ---- tools WorkBuddy takes ----------------------------------------------------
@@ -1138,6 +1372,62 @@ function fitted(body) {
   }
 }
 
+// gzipped is a chat's body compressed, as WorkBuddy's own client sends its
+// model requests: its CLI's GzipRequestProcessor (WorkBuddy 5.9.3, CLI
+// 2.165.0, on both builds) gzips each POST's body and sets
+// Content-Encoding: gzip when the product's RequestBodyGzip feature is on,
+// which both builds' product.json turn on and /v3/config (merged over it)
+// doesn't turn off. Sent as plain JSON, a long agent conversation went up
+// whole on every step: runmiNeverstop on X saw 2.89 GB up to
+// copilot.tencent.com against 258 MB down. Measured 2026-10-28 on
+// www.workbuddy.ai: a gzipped chat answers as the plain one does. A
+// Messages request (Claude on the China build) goes as it came: that route
+// wasn't tried gzipped. Only a chat completion goes gzipped (isCompletion):
+// WorkBuddy's images API reads its body as plain JSON, and magpie's drawing
+// (/v2/images/generations, /v2/images/edits) is sent through this same
+// fetch; gzipped it answered 400 11101 "invalid character '\x1f'" (iwinux on
+// Discord, 0.1.43). null when the body isn't sent gzipped.
+function gzipped(completion, b) {
+  if (!completion) return null
+  if (typeof b === "string") return gzipSync(Buffer.from(b))
+  if (b instanceof ArrayBuffer || ArrayBuffer.isView(b)) return gzipSync(b)
+  return null
+}
+
+// prepared is a request's body read once for every change the loader makes
+// to it and everything it reads off it (plugins#461): a long chat, 45 MiB
+// of history, was parsed six times on its way, once by each step, and
+// written out again whole by normalizeToolChoice even when nothing changed.
+// chat is the parsed body, changed whether any step changed it; the caller
+// writes it out once, when it did. Each step is the one its own function
+// above makes, in the same order.
+function prepared(body, native) {
+  if (!native && (body instanceof ArrayBuffer || ArrayBuffer.isView(body))) body = new TextDecoder().decode(body)
+  const none = { body, chat: null, names: new Map(), changed: false }
+  if (typeof body !== "string") return none
+  let chat
+  try {
+    chat = JSON.parse(body)
+  } catch {
+    return none
+  }
+  if (chat === null || typeof chat !== "object") return none
+  if (native) return { body, chat, names: new Map(), changed: unsignedOn(chat) }
+  try {
+    let changed = systemOn(chat)
+    const fit = fitTools(chat)
+    if (fit.changed) changed = true
+    if (toolChoiceOn(chat)) changed = true
+    return { body, chat, names: fit.names, changed }
+  } catch {
+    // a shape a step can't take: the steps one by one, each keeping the
+    // body as it was when it can't, as they always have
+    const fit = fitted(withSystem(body))
+    const out = normalizeToolChoice(fit.body)
+    return { body: out, chat: chatOf(out), names: fit.names, changed: false }
+  }
+}
+
 // namedBack gives the model's calls in a chat answer (one JSON body, or an
 // SSE stream's chunks) the names the client gave its tools.
 function namedBack(v, names) {
@@ -1387,7 +1677,7 @@ const statusText = (n) => STATUS_TEXT[n] || `HTTP ${n}`
 function meterAsked(site, a, path, body = {}, signal = AbortSignal.timeout(20000)) {
   return fetch(site.endpoint + path, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json", "User-Agent": "WorkBuddy/" + UA_VERSION,
+    headers: { "Content-Type": "application/json", Accept: "application/json", "User-Agent": "WorkBuddy/" + site.app,
       Authorization: "Bearer " + a.access, "X-User-Id": a.uid ?? "", "X-Domain": domainOf(site, a), "X-Product": "SaaS",
       "X-IDE-Type": "WorkBuddy", ...enterpriseHeaders(a) },
     body: JSON.stringify(body),
@@ -1419,6 +1709,8 @@ async function unanswered(site, a, body, err, signal) {
   if (signal?.aborted || err?.name === "AbortError" || err?.name === "TimeoutError") throw err
   const size = byteLength(body)
   if (size <= EDGE_READS) throw err
+  // the billing API isn't asked with a key: what it answers one is unknown
+  if (a.source === "key") throw err
   let status = 0
   let challenge = ""
   try {
@@ -1544,6 +1836,18 @@ function refusedText(site, a, why, note) {
       ? `Sign in to ${site.name} desktop again; magpie reads its sign-in on the next request.`
       : `Sign in to it again in magpie: Providers → ${site.name} → this account's Sign in again.`)
   )
+}
+
+// keyRefused is the answer to a request WorkBuddy refused an API key for
+// (401): a key isn't renewed, so it says to check the key. Marked expired
+// only on WorkBuddy's word that the token itself is refused (invalidToken).
+function keyRefused(site, expired, note) {
+  const message = `${site.name} refused this API key (401). ${note ? note + " " : ""}Check the key at ${site.keys}, then add it again in magpie: Providers → ${site.name}.`
+  return new Response(JSON.stringify({ error: { message, type: "authentication_error", code: 401 } }), {
+    status: 401,
+    statusText: "Unauthorized",
+    headers: { "content-type": "application/json", "X-Magpie-Sign-In": expired ? "expired" : "kept" },
+  })
 }
 
 // signedOut is the answer to a request WorkBuddy refused this account's
@@ -2151,14 +2455,31 @@ function pinned(rows, account) {
 // as used or left beside the share (magpie#659). The free plan is said as a
 // plan: "Free" alone beside the account read as the model being free, and
 // routing as preferring it for that (#337).
+//
+// A package with no CycleTotalCapacity has no denominator: it is sent as
+// magpie's balance-shaped window (#3950), {balance, unit} with no used,
+// limit or aside, and routing ranks it by what is left. A literal "0" total
+// is still a total, not a wallet: it stays on the old path, so a lapsed or
+// placeholder package adds nothing. A literal "0" remainder is a reading
+// of nothing left, not an absent field; only a package with no
+// CycleRemainCapacity at all leaves the window out. TotalCredits is not a
+// fallback: an account with no packages at all keeps its unknown allowance,
+// as before, so its free models are not skipped.
 function usageOf(sum, plan) {
   const out = { plan: plan || (sum?.IsPaidUser ? "Pro" : "Free plan"), windows: [] }
-  let total = 0, used = 0
+  let total = 0, used = 0, left = 0, bags = 0
   for (const p of sum?.Packages ?? []) {
-    total += capacity(p?.CycleTotalCapacity)
-    used += capacity(p?.CycleUsedCapacity)
+    const hasTotal = p?.CycleTotalCapacity != null && p.CycleTotalCapacity !== ""
+    if (hasTotal) {
+      total += capacity(p.CycleTotalCapacity)
+      used += capacity(p?.CycleUsedCapacity)
+    } else if (p?.CycleRemainCapacity != null && p.CycleRemainCapacity !== "") {
+      left += capacity(p.CycleRemainCapacity)
+      bags++
+    }
   }
   if (total > 0) out.windows.push({ name: "Credits", used: (100 * used) / total, display: `${compact(used)} / ${compact(total)}`, amount: used, limit: total, unit: "credits" })
+  if (bags > 0 && (total === 0 || left > 0)) out.windows.push({ name: "Prepaid credits", balance: left, display: `${compact(left)} credits`, unit: "credits" })
   return out
 }
 
@@ -2267,6 +2588,45 @@ function runsOutOf(sum, packages, now = Date.now()) {
     else if (end === at) amount += left
   }
   return at ? { runsOutAt: new Date(at).toISOString(), runsOut: amount } : null
+}
+
+// cycleOf is when the plan's credits start again, as WorkBuddy's own client
+// says it (getCurrentPlan's refreshAt): the cycle end of the package the
+// summary names as the subscription (SubscriptionPackageCode), in UTC+8,
+// with how long the cycle is. Without it the card had used credits and no
+// reset, and magpie said "Not used yet" beside 46% (windy on Discord,
+// 2026-10-26). null when the subscription isn't in the lists, or its cycle
+// is over.
+function cycleOf(sum, packages, now = Date.now()) {
+  const code = sum?.SubscriptionPackageCode
+  const at = (v) => (typeof v === "string" && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(v.trim()) ? Date.parse(v.trim().replace(" ", "T") + "+08:00") : 0)
+  const of = (p) => {
+    const end = at(p?.CycleEndTime), start = at(p?.CycleStartTime)
+    if (!(end > now)) return null
+    return { resetsAt: new Date(end).toISOString(), ...(start > 0 && start < end ? { span: (end - start) / 1000 } : {}) }
+  }
+  // A summary that does name one goes by it alone: named and not listed, or
+  // its cycle over, is unknown — a paid plan's cycle is its subscription's,
+  // never the slice's (yetone, #415).
+  if (code) {
+    for (const p of packages ?? []) if (p?.PackageCode === code) return of(p)
+    return null
+  }
+  // A free account's summary names no subscription at all: both sites answer
+  // SubscriptionPackageCode "" (copilot.tencent.com and www.workbuddy.ai,
+  // measured 2026-10-26 on eight CN accounts and one AI one), so this
+  // returned null and the card of an account whose credits are being spent
+  // said nothing of when they come back — the one thing cycleOf is for.
+  //
+  // Its plan's own credits are the slice (CapacityType 4): packagesOf's
+  // free list returns a month's plan_base with it, 00:00:00 to 23:59:59
+  // UTC+8, the same cycle on every account on both sites (500 credits on
+  // the CN site, 100 on the international), and its CycleEndTime is when
+  // the plan gives the next month's back. A slice tells no account apart,
+  // which is why runsOutOf keeps it out: which account to spend first is a
+  // different question from when the plan refills.
+  for (const p of packages ?? []) if (String(p?.CapacityType) === SLICE) return of(p)
+  return null
 }
 
 // ---- models -----------------------------------------------------------------
@@ -2414,10 +2774,54 @@ function effortsOf(d, site, id) {
   return EFFORT_ORDER.filter((e) => set.has(e))
 }
 
+// isCompletion is whether a request is a chat completion: one to
+// .../chat/completions, or, with no URL to read, a body holding a chat's
+// messages. Nothing else the loader's fetch sends (magpie's drawings to
+// /v2/images/*) is a chat: it goes neither gzipped nor given an effort.
+function isCompletion(url, chat) {
+  let path = ""
+  try {
+    path = new URL(String(url ?? "")).pathname
+  } catch {}
+  if (path) return /\/chat\/completions$/.test(path)
+  return Array.isArray(chat?.messages)
+}
+
+// defaultEffortOf is the level WorkBuddy's own client asks a model for when
+// the user picked none: its CLI's configureThinkingSettings (WorkBuddy
+// 5.9.3, CLI 2.165.0) takes the session's effort, else the settings', else
+// the config's reasoning.defaultEffort, else reasoning.effort, and sends it
+// as reasoning_effort unless thinking was turned off. A request with no
+// reasoning_effort is not thinking on WorkBuddy's side: measured 2026-10-28
+// on www.workbuddy.ai, deepseek-v4.1-flash (defaultEffort "high") answered
+// with 0 reasoning tokens without one, and thought at low and high
+// (troilus1011 on X, OpenCode's default variant). A default the model's
+// levels don't hold is left out, as the CLI clamps it to one they do.
+function defaultEffortOf(d, efforts) {
+  const own = d.reasoning?.defaultEffort ?? d.reasoning?.effort
+  return typeof own === "string" && efforts.includes(own) ? own : undefined
+}
+
+// withDefaultEffort gives a chat that names no effort the model's default
+// (defaultEffortOf), as WorkBuddy's client sends it; true when it did. An
+// effort the client named, "none" too, goes as it came.
+function withDefaultEffort(chat, list) {
+  if (!chat || typeof chat !== "object" || namesEffort(chat)) return false
+  const m = list?.find((x) => x.id === chat.model)
+  if (!m?.effort) return false
+  chat.reasoning_effort = m.effort
+  return true
+}
+
+// namesEffort is whether a chat names its effort itself, in either spelling
+function namesEffort(chat) {
+  return chat.reasoning_effort !== undefined || (!!chat.reasoning && typeof chat.reasoning === "object" && chat.reasoning.effort !== undefined)
+}
+
 async function liveModels(site, a) {
   const headers = new Headers()
   sign(site, a, headers)
-  headers.set("User-Agent", `CLI/${APP_VERSION} WorkBuddy/${UA_VERSION}`)
+  headers.set("User-Agent", cliAgent(site))
   headers.set("X-Requested-With", "XMLHttpRequest")
   headers.set("Accept", "application/json")
   const res = await fetch(site.endpoint + "/v3/config", { headers, signal: AbortSignal.timeout(15000) })
@@ -2440,6 +2844,8 @@ async function liveModels(site, a) {
         if (es.length) {
           const canOff = d.reasoning?.canDisableThinking
           m.efforts = [...(!d.onlyReasoning && (canOff == null || canOff) ? ["none"] : []), ...es]
+          const def = defaultEffortOf(d, es)
+          if (def) m.effort = def
         }
       }
       out.push(m)
@@ -2480,13 +2886,42 @@ const AFTER_TOOLS_REFUSED = /must end with a user message|["']code["']\s*:\s*["'
 // ending with the assistant's message is a prefill, refused as it is.
 function replyAfterTools(body) {
   const b = chatOf(body)
+  return replyAfterToolsOn(b) ? JSON.stringify(b) : null
+}
+
+// replyAfterToolsOn makes replyAfterTools's change on a chat's object; false
+// for a chat it doesn't take
+function replyAfterToolsOn(b) {
   const msgs = b?.messages
-  if (!Array.isArray(msgs)) return null
+  if (!Array.isArray(msgs)) return false
   let i = msgs.length - 1
   while (i >= 0 && msgs[i]?.role === "user") i--
-  if (i === msgs.length - 1 || i < 0 || msgs[i]?.role !== "tool") return null
+  if (i === msgs.length - 1 || i < 0 || msgs[i]?.role !== "tool") return false
   msgs.splice(i + 1, 0, { role: "assistant", content: "" })
-  return JSON.stringify(b)
+  return true
+}
+
+// FREE_ONLY is the switch that keeps an account off credits (#430): its
+// list holds only the models WorkBuddy serves at no cost (priceOf's free),
+// and a request for any other is answered here, never sent. A price that
+// can't be read is not free, and a list that can't be read sends nothing.
+const FREE_ONLY = "free_only"
+// PRICE_TTL is how long a list read for that check is used before it is
+// read again: a promotion that ends stops counting as free within it.
+const PRICE_TTL = 60_000
+
+// notFree is the answer to a request the switch keeps from WorkBuddy. Its
+// words say the model, not the account, is what is turned away, so magpie
+// rests that model alone and asks another provider of it; they name no
+// quota or credit, which would rest the whole account as out of credit.
+function notFree(site, model, why) {
+  const msg = why
+    ? `${site.name}'s model list couldn't be read (${why}), so whether model ${model || "(none)"} is free is unknown; with "Free models only" on it isn't sent`
+    : `model ${model || "(none)"} is not available while "Free models only" is on: ${site.name} charges for it. Turn the switch off in ${site.name}'s provider settings to use it`
+  return new Response(JSON.stringify({ error: { message: msg, type: "invalid_request_error", code: why ? "free_only_unknown" : "model_not_found" } }), {
+    status: why ? 503 : 404,
+    headers: { "content-type": "application/json", "X-Magpie-Sign-In": "kept" },
+  })
 }
 
 function makePlugin(site) {
@@ -2496,7 +2931,48 @@ function makePlugin(site) {
   // the system prompts this run WorkBuddy refused as an unapproved channel:
   // their next chats go with systemAsUser at once, not refused first
   const refusedSystems = new Set()
-  return async ({ client }) => ({
+  return async ({ client, magpie }) => {
+  // each account's list as last read, for FREE_ONLY: {at, list}
+  const lists = new Map()
+  const listKey = (a) => `${a.uid ?? ""}|${a.enterpriseId ?? ""}|${a.source === "key" ? a.key : ""}`
+  // listed is the account's live list, read again past PRICE_TTL
+  const listed = async (a, fresh = false) => {
+    const k = listKey(a)
+    const was = lists.get(k)
+    if (!fresh && was && Date.now() - was.at < PRICE_TTL) return was.list
+    const list = await liveModels(site, a)
+    lists.set(k, { at: Date.now(), list })
+    if (lists.size > 64) lists.delete(lists.keys().next().value)
+    return list
+  }
+  // effortList is the list a chat's default effort is read from
+  // (withDefaultEffort): listed's, or null when there is none to read — a
+  // key WorkBuddy's CLI reads no config with (as models does), or a read
+  // that failed within PRICE_TTL, so a config that can't be read costs a
+  // chat one try a minute, not one each
+  const unlisted = new Map()
+  const effortList = async (a) => {
+    if (a.source === "key" && !remoteConfig(a.key)) return null
+    const k = listKey(a)
+    if (Date.now() - (unlisted.get(k) ?? 0) < PRICE_TTL) return null
+    try {
+      return await listed(a)
+    } catch {
+      unlisted.set(k, Date.now())
+      if (unlisted.size > 64) unlisted.delete(unlisted.keys().next().value)
+      return null
+    }
+  }
+  const freeOnly = () => magpie?.option?.(site.id, FREE_ONLY) === true
+  // onlyFree is a list with the switch on: its free models, or a failure
+  // when there are none to tell (magpie then keeps the list it had)
+  const onlyFree = (ms) => {
+    if (!freeOnly()) return ms
+    const free = ms.filter((m) => m.free)
+    if (!free.length) throw new Error(`${site.name} lists no free model, and "Free models only" is on`)
+    return free
+  }
+  return {
     config: async (config) => {
       config.provider ??= {}
       config.provider[site.id] ??= {}
@@ -2518,15 +2994,37 @@ function makePlugin(site) {
       // the account's own list, when it's signed in and WorkBuddy answers;
       // else the list above
       async models(provider, { auth }) {
+        if (auth?.type === "api") {
+          // asked as WorkBuddy's own CLI asks with a key (remoteConfig)
+          const a = keyAccount(auth)
+          if (!a || !remoteConfig(a.key)) {
+            if (freeOnly()) throw new Error(`${site.name} lists no prices for this key, and "Free models only" is on`)
+            return provider.models
+          }
+          let ms
+          try {
+            ms = await listed(a, true)
+          } catch (e) {
+            if (freeOnly()) throw e
+            return provider.models
+          }
+          if (!ms.length && !freeOnly()) return provider.models
+          return Object.fromEntries(onlyFree(ms).map((m) => [m.id, modelOf(site, provider, m)]))
+        }
         if (auth?.type !== "oauth" || !(auth.access || auth.source)) return provider.models
+        let ms
         try {
           const a = await current(site, client, auth)
-          const ms = await liveModels(site, a)
-          if (!ms.length) return provider.models
-          return Object.fromEntries(ms.map((m) => [m.id, modelOf(site, provider, m)]))
-        } catch {
+          ms = await listed(a, true)
+        } catch (e) {
+          // with the switch on, a list without prices would offer models
+          // that cost credits: the failure goes up, and magpie keeps the
+          // list it had
+          if (freeOnly()) throw e
           return provider.models
         }
+        if (!ms.length && !freeOnly()) return provider.models
+        return Object.fromEntries(onlyFree(ms).map((m) => [m.id, modelOf(site, provider, m)]))
       },
     },
     auth: {
@@ -2538,9 +3036,16 @@ function makePlugin(site) {
       // and is renewed as before.
       refreshLead: LEAD_MS,
       refresh: (auth) => refreshed(site, auth),
+      options: [
+        {
+          key: FREE_ONLY,
+          label: "Free models only",
+          description: `Lists only the models ${site.name} serves at no cost, and turns away a request for any other here instead of sending it, so no credits are spent. A model free only at night counts as paid.`,
+        },
+      ],
       async loader(getAuth) {
         const auth = await getAuth()
-        if (auth?.type !== "oauth") return {}
+        if (auth?.type !== "oauth" && auth?.type !== "api") return {}
         return {
           // no baseURL: a model's own api.url says where it is served —
           // <endpoint>/v2 for a chat, <endpoint>/v1 for a Claude model on
@@ -2549,8 +3054,9 @@ function makePlugin(site) {
           apiKey: "",
           async fetch(input, init) {
             const stored = await getAuth()
-            if (stored?.type !== "oauth") throw new Error(`${site.name} isn't signed in`)
-            let a = await current(site, client, stored)
+            const keyed = stored?.type === "api" ? keyAccount(stored) : null
+            if (stored?.type !== "oauth" && !keyed) throw new Error(`${site.name} isn't signed in`)
+            let a = keyed ?? (await current(site, client, stored))
             const req = input instanceof Request ? input : null
             const headers = new Headers(init?.headers ?? req?.headers)
             headers.delete("authorization")
@@ -2570,18 +3076,42 @@ function makePlugin(site) {
             // Codex's and DeepSeek Harness's openings all answer on
             // /v1/messages, where a chat is refused 11128.
             const native = isMessages(req ? req.url : String(input), body)
-            let names = {}
-            if (!native) {
-              body = withSystem(body)
-              const fit = fitted(body)
-              body = normalizeToolChoice(fit.body)
-              names = fit.names
-            } else {
-              body = withoutUnsigned(body)
+            // read once (prepared): nothing below parses the body again on
+            // its way out, and nothing keeps the parsed chat once it is
+            // written (plugins#461)
+            let chat, changed, names
+            ;({ body, chat, changed, names } = prepared(body, native))
+            if (native) names = {}
+            // the switch is checked before anything is sent: a model not
+            // free, or one whose price can't be read, never reaches
+            // WorkBuddy. The model is read off the chat parsed above; a body
+            // prepared leaves unread (bytes on Messages) is read for it.
+            if (freeOnly()) {
+              const model = (chat ?? chatOf(typeof body === "string" ? body : bodyString(body)))?.model
+              let list
+              try {
+                list = await listed(a)
+              } catch (e) {
+                return notFree(site, model, e?.message ?? String(e))
+              }
+              if (!list.some((m) => m.id === model && m.free)) return notFree(site, model)
             }
-            attend(headers, body, session)
-            const post = (b) =>
-              fetch(req ? req.url : input, { ...init, method: init?.method ?? req?.method, headers, body: b }).catch((e) => unanswered(site, a, b, e, init?.signal))
+            // a chat that names no effort is asked at the model's default,
+            // as WorkBuddy's client asks it (withDefaultEffort); with no
+            // list to read (effortList) the chat goes as it came
+            const completion = !native && isCompletion(req ? req.url : input, chat)
+            if (completion && chat && !namesEffort(chat) && withDefaultEffort(chat, await effortList(a))) changed = true
+            chatHeaders(site, headers)
+            let who = scopeOf(a)
+            let ids = attendChat(headers, chat, session, who)
+            const post = (b) => {
+              // a chat goes gzipped, as WorkBuddy's client sends it
+              // (gzipped); its size on the wire is what unanswered weighs
+              const z = gzipped(completion, b)
+              if (z) headers.set("Content-Encoding", "gzip")
+              else headers.delete("Content-Encoding")
+              return fetch(req ? req.url : input, { ...init, method: init?.method ?? req?.method, headers, body: z ?? b }).catch((e) => unanswered(site, a, z ?? b, e, init?.signal))
+            }
             // a 401 is answered once, on whichever try meets it: by a
             // sign-in with another access token (reissued), the request
             // sent once more with it, never again after that; else, or
@@ -2607,6 +3137,12 @@ function makePlugin(site) {
               const res = await post(b)
               if (res.status !== 401) return res
               if (renewed) return out("it refused the token renewed for it too", invalidToken(res), res)
+              // a key isn't renewed: the 401 says the key was refused
+              if (a.source === "key") {
+                const r = keyRefused(site, invalidToken(res), edgeNotes.get(res))
+                ours.add(r)
+                return r
+              }
               if (!resendable(b)) return res
               await res.body?.cancel().catch(() => {})
               const r = await reissued(site, client, getAuth, a, stored.access)
@@ -2614,19 +3150,28 @@ function makePlugin(site) {
               renewed = true
               a = r.a
               sign(site, a, headers)
+              ids = reattend(headers, ids, who, (who = scopeOf(a)))
               const again = await post(b)
               if (again.status !== 401) return again
               return out("it refused the token renewed for it too", invalidToken(again), again)
             }
             // a model known to turn tool results then the user's message away
             // gets the empty reply between them up front (see endsAfterTools)
-            const model = chatOf(body)?.model
+            const model = chat?.model
             // a system prompt WorkBuddy refused before goes as the user's
             // words at once (see systemAsUser)
-            const sysKey = native ? "" : systemKey(body)
-            if (sysKey && refusedSystems.has(sysKey)) body = systemAsUser(body) ?? body
+            const sysKey = native ? "" : systemKeyOf(chat)
+            if (sysKey && refusedSystems.has(sysKey) && systemAsUserOn(chat)) changed = true
+            // shaped is a body as such a model takes it. The first try's
+            // is made on the chat already parsed, after the move above,
+            // as shaped would make it of the body written; a resend with
+            // the system prompt moved (below) is shaped again, and a body
+            // that has the reply already is left as it is.
             const shaped = (b) => (!native && endsAfterTools.has(model) ? replyAfterTools(b) ?? b : b)
-            let res = await send(shaped(body))
+            if (!native && endsAfterTools.has(model) && replyAfterToolsOn(chat)) changed = true
+            if (changed) body = JSON.stringify(chat)
+            chat = null
+            let res = await send(body)
             // a signature WorkBuddy's own signing didn't make — a session
             // moved here from another provider keeps its thinking blocks,
             // and a truncated or altered one reads the same way — is 11159
@@ -2671,6 +3216,9 @@ function makePlugin(site) {
       // an account lapsed nor cleared it, but for a 401 (gone, below)
       async usage(getAuth) {
         const auth = await getAuth()
+        // WorkBuddy's own CLI reads no credits with a key, and what the
+        // billing API answers one is unknown, so a key's card says so
+        if (auth?.type === "api") return { error: `credits unknown with an API key (WorkBuddy's own client reads none with one); see ${site.keys.replace(/\/profile\/keys$/, "")}`, signIn: "kept" }
         if (auth?.type !== "oauth" || !(auth.access || auth.source)) return { error: "not signed in", signIn: "kept" }
         try {
           let a = await current(site, client, auth)
@@ -2709,12 +3257,14 @@ function makePlugin(site) {
             } catch {}
             if (ent) return { plan: auth.plan || "Enterprise", windows: await spareFree(site, a, [ent]), signIn: said }
           }
-          // when the credits left run out, for routing to spend them first;
+          // when the plan's credits start again (cycleOf), and when the credits
+          // left run out, for routing to spend them first (runsOutOf);
           // a list that can't be read leaves it unknown, the card stands
           const credits = out.windows.find((w) => w.name === "Credits")
           if (credits) {
             try {
-              Object.assign(credits, runsOutOf(sum, await packagesOf(site, a)) ?? {})
+              const packages = await packagesOf(site, a)
+              Object.assign(credits, cycleOf(sum, packages) ?? {}, runsOutOf(sum, packages) ?? {})
             } catch {}
           }
           await spareFree(site, a, out.windows)
@@ -2744,9 +3294,17 @@ function makePlugin(site) {
           label: `${site.name} desktop's sign-in`,
           authorize: async () => desktopSignIn(site),
         },
+        {
+          // a key made at site.keys, sent as WorkBuddy's CLI sends one
+          // (keyAccount)
+          type: "api",
+          label: `${site.name} API key`,
+          placeholder: `from ${site.keys.replace(/^https:\/\//, "")}`,
+        },
       ],
     },
-  })
+  }
+  }
 }
 
 // REFUSED_HINT is what the user can do about WorkBuddy's "Illegal API
@@ -2851,4 +3409,4 @@ export const WorkBuddyAuthPlugin = makePlugin(SITES.workbuddy)
 export const WorkBuddyAIAuthPlugin = makePlugin(SITES["workbuddy-ai"])
 
 // for tests
-export const _internal = { typeUnions, systemAsUser, systemKey, DEFAULT_SYSTEM, EDGE_READS, fitShape, replyAfterTools, AFTER_TOOLS_REFUSED, enterpriseUsageOf, notDesktop, textOnly, runsOutOf, packagesOf, endOf, enterpriseHeaders, enterpriseOf, liveModels, browserSignIn, withSystem, normalizeToolChoice, fitTools, fitted, renamed, unflagged, usageOf, desktopHeld, explained, REFUSED_HINT, RESTRICTED_HINT, EXHAUSTED_HINT, freeCredits, creditsOf, priceOf, fresh, SITES, renewing, renewed, SESSION, attend, turnKey, conversationKey, signatureOf, isMessages, withoutUnsigned, withoutSignedThinking, answeredBefore, nativeOf, modelOf, configModels, freeWindowOf, tokensShort, freeWindowRows, freeWindowLedger, readLedgerTail, pinned, rowTime, rowAccount, ofAccount, windowOffset, windowReset, FREE_WINDOW_MODELS, FREE_WINDOW_SPAN, FREE_WINDOW_GAP, FREE_WINDOW_LEAD, API_MESSAGES: NPM_MESSAGES, API_CHAT: NPM }
+export const _internal = { idFor, replyAfterToolsOn, withDefaultEffort, defaultEffortOf, gzipped, FREE_ONLY, PRICE_TTL, keyAccount, remoteConfig, cycleOf, typeUnions, systemAsUser, systemKey, DEFAULT_SYSTEM, EDGE_READS, fitShape, replyAfterTools, AFTER_TOOLS_REFUSED, enterpriseUsageOf, notDesktop, textOnly, runsOutOf, packagesOf, endOf, enterpriseHeaders, enterpriseOf, liveModels, browserSignIn, withSystem, asReasoning, normalizeToolChoice, fitTools, fitted, renamed, unflagged, usageOf, desktopHeld, explained, REFUSED_HINT, RESTRICTED_HINT, EXHAUSTED_HINT, freeCredits, creditsOf, priceOf, fresh, SITES, renewing, renewed, SESSION, attend, scopeOf, turnKey, conversationKey, signatureOf, isMessages, withoutUnsigned, withoutSignedThinking, prepared, answeredBefore, nativeOf, modelOf, configModels, freeWindowOf, tokensShort, freeWindowRows, freeWindowLedger, readLedgerTail, pinned, rowTime, rowAccount, ofAccount, windowOffset, windowReset, FREE_WINDOW_MODELS, FREE_WINDOW_SPAN, FREE_WINDOW_GAP, FREE_WINDOW_LEAD, API_MESSAGES: NPM_MESSAGES, API_CHAT: NPM }

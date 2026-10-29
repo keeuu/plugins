@@ -26,6 +26,15 @@ The package exports `WorkBuddyAuthPlugin` (`workbuddy`) and
 
   WorkBuddy 5.6 and later keep the sign-in encrypted, which only the app
   opens, so this way fails there and says so: use the browser sign-in.
+- **API key** (since 0.1.37). A key made on the build's own keys page
+  (`https://www.workbuddy.cn/profile/keys` for `workbuddy`,
+  `https://www.workbuddy.ai/profile/keys` for `workbuddy-ai`), sent as
+  WorkBuddy's own CLI sends one: `X-API-Key` and `Authorization: Bearer`,
+  both the key, and `X-User-Id: anonymous_<the key's last 8 characters>`,
+  to the same API as the other sign-ins. A key isn't renewed; a refused one
+  says to check it. A key's credits are unknown (WorkBuddy's own client reads
+  none with a key), and its models are `/v3/config`'s only for `ck_`/`pt_`
+  keys, as the CLI asks; any other key keeps the list below.
 
 A browser sign-in is kept as an OpenCode `oauth` auth: the access and
 refresh tokens, their expiry, the user id and the domain; desktop's as a
@@ -115,7 +124,11 @@ estimate.
 
 Each chat carries WorkBuddy's headers:
 - `Authorization`, `X-User-Id`, `X-Domain`, `X-Product: SaaS`, `X-IDE-Type: WorkBuddy`;
-- `User-Agent: WorkBuddy/5.5.6`. Without it, WorkBuddy answers error 10085;
+- the desktop CLI's `User-Agent`, `WorkBuddy/<app> <appName>/<app> CLI/<cli>`:
+  `WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0` on the China build and
+  `WorkBuddy/5.9.3 workbuddy-ai/5.9.3 CLI/2.165.0` on WorkBuddy AI, each
+  build's current app on 2026-10-29; `X-IDE-Version` is the app's version.
+  A User-Agent not starting `WorkBuddy/<version>` is answered error 10085;
 - the client's, which WorkBuddy's usage list shows as the client that asked
   (使用端): `X-Agent-Purpose: conversation`, `X-IDE-Name: WorkBuddy`,
   `X-IDE-Version`, `X-Agent-Intent: craft`, `X-Requested-With`. Both builds
@@ -124,13 +137,24 @@ Each chat carries WorkBuddy's headers:
 - the conversation's ids: `X-Conversation-ID`, `X-Conversation-Request-ID`,
   `X-Conversation-Message-ID`, `X-Request-ID`. WorkBuddy's backend counts a
   user send as one request by `X-Conversation-Request-ID`, so every step of
-  one send — a tool result sent back, a retry, another account answering —
-  carries the same one, and the user's next message carries another. The
+  one send — a tool result sent back, a retry — carries the same one, and
+  the user's next message carries another. Both ids are one account's own,
+  as WorkBuddy's client is signed in as one: a conversation sent as another
+  account (another of a group, or a sign-in saved since) carries that
+  account's ids, never the same ones under two `X-User-Id`s. The
   conversation's is the session magpie (or OpenCode) names the request by,
   else the chat's first user message; nothing is made up when neither names
   one, a made-up conversation of the request's own being what splits one
   conversation into many in the usage detail;
-- WorkBuddy AI also takes `X-Agent-Type: main`.
+- what the CLI adds to a model request alone: `X-Agent-Type: main` on both
+  builds, `X-Agent-Runtime: local-agent` (new in 5.9),
+  `Accept: application/json`, and the `X-Stainless-*` headers of the OpenAI
+  SDK it sends through (openai 6.25.0 on Electron 37's Node v22.21.1, a
+  1200s timeout, no retries).
+
+Not sent: `X-Device-Token`, which the desktop app gets from Tencent's
+native device SDK before each prompt, and a `traceparent`, which the CLI
+adds only while its server-side tracing is on.
 
 A chat that doesn't open with a system message is given WorkBuddy's
 default one, as the app does.
@@ -155,8 +179,12 @@ refusal rests the account.
 
 The loader also translates OpenAI-compatible request spellings WorkBuddy
 doesn't take: `max_completion_tokens` becomes `max_tokens`, `developer`
-messages become `system`, and an object `tool_choice` becomes WorkBuddy's
-string form.
+messages become `system`, an object `tool_choice` becomes WorkBuddy's
+string form, and an earlier assistant turn's `reasoning_content` (or
+`reasoning_details` text) goes as `reasoning`, the field WorkBuddy's own
+client sends. WorkBuddy drops `reasoning_content`, so a client such as Grok
+Build that sends it lost its earlier thinking; nothing is folded into the
+message's content.
 
 A chat's tools are given shapes WorkBuddy's models take. Without them
 WorkBuddy AI answers 400 "Invalid request parameters" (11133), DeepSeek's
@@ -210,7 +238,18 @@ is used.
 - Kimi-K3, Kimi-K2.6
 - MiniMax-M3
 
-A model's reasoning levels are its variants (`reasoningEffort`).
+A model's reasoning levels are its variants (`reasoningEffort`). A chat
+that names no level goes at the model's own default from the config
+(`reasoning.defaultEffort`, "high" for DeepSeek-V4.1-Flash), as WorkBuddy's
+client sends it: WorkBuddy doesn't think when a chat names none, so
+OpenCode's default variant got answers without thinking. An effort the
+client names, `none` too, goes as it came.
+
+A chat goes gzipped (`Content-Encoding: gzip`), as WorkBuddy's own client
+sends its model requests (`RequestBodyGzip` in both builds' product.json).
+Claude's Messages route goes as it came, and so does anything that isn't a
+chat completion: magpie's drawings (`/v2/images/generations`,
+`/v2/images/edits`) go as plain JSON, which is all the images API reads.
 
 A model's price is its `credits` ("x0.29") and the config's
 `modelPromotions`. A discount for whole days (Step-5-Preview's 独家限免) is
@@ -218,6 +257,22 @@ the price now, with the price before it (`rateWas`). A price that holds only
 some hours of the day (Hy4 preview, free 23:00–8:00) is given as its full
 price, never as free: magpie keeps the list until it asks again, so a list
 asked for at night would say "free" all day (#121).
+
+### Free models only
+
+Each site (WorkBuddy, WorkBuddy AI) has a "Free models only" switch in its
+provider settings in magpie, off by default (#430). When it is on:
+
+- the list holds only the models the site serves at no cost now. A model free
+  only at night, or one with no price, counts as paid;
+- a request for any other model is answered by the plugin with a 404
+  `model_not_found` and never sent, so no credits are spent. magpie rests
+  only that model and tries the next provider;
+- if the price list can't be read, nothing is sent (503), since whether the
+  model is free is unknown. An API key WorkBuddy lists no prices for lists
+  no models.
+
+The price list is read again at most once a minute for requests.
 
 ## Credits in magpie
 

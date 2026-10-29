@@ -30,7 +30,8 @@ over Anthropic's Messages API. Provider id: `zcode`.
     request, and the plan's endpoint keeps a prompt cache on the machine it
     picks by it, so without it the cache is mostly missed (#387). An
     account known only by its key gets a device id made from the key, the
-    same on every start. zcode.z.ai also
+    same on every start. Every request also carries the `x-session-id`
+    header below. zcode.z.ai also
     answers 405 code 3012 to every request of an account its risk control
     blocked, ZCode's own app's included (plugins#348). That answer comes
     back as ZCode's words, then "ZCode's risk control blocked this account
@@ -40,6 +41,14 @@ over Anthropic's Messages API. Provider id: `zcode`.
     firewall says this network's address was blocked instead.
   - The Start Plan's token can't be refreshed. When it runs out, sign in
     again.
+  - Every request, on any plan, names its conversation in `x-session-id`,
+    as ZCode does: a bare UUID, the same on each turn. BigModel's prompt
+    cache follows it: without it a long conversation's turns hit the cache
+    about one time in twenty, with it nearly every turn (#387). The
+    agent's own session id (magpie tells it to the plugin) goes as it is
+    when it is a UUID, else as a UUID made from it, so the vendor sees
+    only ZCode's format; with none, a UUID made from the device. The same
+    id is `metadata.user_id`'s `session_id`, as in ZCode's requests.
 - **ZCode: a team's GLM Coding Plan**
   - For an account with a plan of its own and a seat on a team's plan
     (#285). The sign-ins above take the account's own plan, as ZCode does
@@ -119,9 +128,35 @@ coding plan; when the gift answers a trial entry with a quota error
 "exceed quota limit", which it can answer inside an HTTP 200) that too
 becomes a 429 and keeps the entry off for a minute. Any other gift
 answer (its 405, its 401, its 5xx) goes on as it came: the user picked
-the gift, so the coding plan is not spent behind their back. Every 429
-counts as spent, Z.ai's 1302/1303 rate limits among them. A stream's
-body is never read or buffered on the way.
+the gift, so the coding plan is not spent behind their back. Every other
+429 counts as spent — Z.ai's 1302/1303 rate limits among them — while the
+plan's own in-flight cap (3008/3009) does not: such a request is asked
+again instead (see [A few at once](#a-few-at-once)). A stream's body is
+never read or buffered on the way.
+
+## A few at once
+
+A plan serves one account a few requests at a time; past that, ZCode
+answers 429 with code 3008 "user concurrency limit exceeded", or 3009
+"model concurrency limit exceeded". magpie funnels every agent's and every
+session's requests of one computer through this one plugin process, so
+magpie's own queue spaces an account's requests by the number this plugin
+declares — `maxConcurrency` on the auth hook, and `magpie.maxConcurrency`
+in its `package.json`, both three. A request the vendor refuses anyway
+waits a moment (a quarter of a second, then longer — about ten seconds of
+waits in all) and asks again, the same request byte for byte. A cap that
+outlasts the waits goes on as a 429, ZCode's words followed by what they
+mean, so the agent reads why. magpie still reads it as a rate limit: the
+account rests a minute and the request goes to the next member of its
+routing group, as it did before.
+
+Three is a default, not a cap the plugin enforces. A plan's real cap
+follows its tier — Z.ai serves a Max plan more at once than a Pro, and a
+Lite fewer — and is higher off-peak
+([Z.ai's usage policy](https://docs.z.ai/devpack/usage-policy)), so a
+number written into the plugin would hold a Max account to a Lite one's
+with no way to raise it. A user who knows their plan's cap sets it on the
+account or the provider in magpie, and magpie's queue follows that.
 
 ## The usage card
 

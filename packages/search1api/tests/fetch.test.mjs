@@ -87,6 +87,14 @@ test("fetch stub: all six tools preserve wire bodies, defaults and complete JSON
   assert.deepEqual(plugin.auth.methods.map((m) => m.type), ["oauth", "api"]);
 });
 
+test("fetch stub: API requests identify the plugin version", async (t) => {
+  const f = await stub(t, () => json({ results: [] }));
+  const plugin = await Search1APIPlugin(f.input, { baseUrl, apiKey: "fixture-key" });
+  await plugin.tool.search.execute({ query: "fixture" }, context());
+  const { version } = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
+  assert.equal(new Headers(f.calls[0].headers).get("user-agent"), `search1api-magpie/${version}`);
+});
+
 test("fetch stub: invalid arguments are refused before any request", async (t) => {
   const f = await stub(t, () => { throw new Error("must not fetch"); });
   const plugin = await Search1APIPlugin(f.input, { baseUrl, apiKey: "fixture-key" });

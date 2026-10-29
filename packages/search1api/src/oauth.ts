@@ -1,11 +1,16 @@
 import { createHash, randomBytes } from "node:crypto";
-import { createServer } from "node:http";
+import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
+import { dirname } from "node:path";
 import { serviceURL, type StoredOAuth } from "./types.ts";
 
 const SCOPES = "openid profile email offline_access";
 const NETWORK_TIMEOUT = 15_000;
 const LOGIN_TIMEOUT = 5 * 60_000;
+// Lets Search1API attribute sign-ups to Magpie; authorization ignores it.
+const SOURCE = "magpie";
+const CALLBACK = /^http:\/\/127\.0\.0\.1:(\d{1,5})\/callback$/;
 
 interface Metadata {
   issuer: string;
@@ -128,8 +133,51 @@ export async function refreshToken(
   );
 }
 
-export async function startOAuth(baseUrl: string, timeoutMs = LOGIN_TIMEOUT) {
+interface SavedClient {
+  issuer: string;
+  clientId: string;
+  redirectUri: string;
+}
+
+// The registered public client and its loopback callback are reused, so each
+// sign-in does not register another OAuth application at Search1API.
+async function savedClient(
+  file: string | undefined,
+  issuer: string,
+): Promise<SavedClient | undefined> {
+  if (!file) return undefined;
+  try {
+    const value = JSON.parse(await readFile(file, "utf8")) as SavedClient;
+    if (
+      value?.issuer === issuer &&
+      typeof value.clientId === "string" &&
+      value.clientId &&
+      typeof value.redirectUri === "string" &&
+      CALLBACK.test(value.redirectUri)
+    )
+      return value;
+  } catch {}
+  return undefined;
+}
+
+function listen(server: Server, port: number) {
+  return new Promise<void>((resolve, reject) => {
+    const failed = (error: Error) => reject(error);
+    server.once("error", failed);
+    server.listen(port, "127.0.0.1", () => {
+      server.off("error", failed);
+      resolve();
+    });
+  });
+}
+
+export async function startOAuth(
+  baseUrl: string,
+  timeoutMs = LOGIN_TIMEOUT,
+  clientFile?: string,
+) {
   const metadata = await discover(baseUrl);
+  let saved = await savedClient(clientFile, metadata.issuer);
   const state = randomBytes(32).toString("base64url");
   const verifier = randomBytes(48).toString("base64url");
   const challenge = createHash("sha256").update(verifier).digest("base64url");
@@ -184,10 +232,14 @@ export async function startOAuth(baseUrl: string, timeoutMs = LOGIN_TIMEOUT) {
         : "Authorization received. Return to Magpie to finish signing in.",
     );
   });
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
-  });
+  try {
+    await listen(server, saved ? Number(CALLBACK.exec(saved.redirectUri)![1]) : 0);
+  } catch (error) {
+    // Its port is taken: sign in through a new client instead.
+    if (!saved) throw error;
+    saved = undefined;
+    await listen(server, 0);
+  }
   server.unref();
   const close = () => {
     server.close();
@@ -200,41 +252,64 @@ export async function startOAuth(baseUrl: string, timeoutMs = LOGIN_TIMEOUT) {
   timer.unref();
   try {
     const redirect = `http://127.0.0.1:${(server.address() as AddressInfo).port}/callback`;
-    const registration = await json<{
-      client_id: string;
-      token_endpoint_auth_method?: string;
-    }>(metadata.registration_endpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        client_name: "Search1API for Magpie",
-        application_type: "native",
-        redirect_uris: [redirect],
-        token_endpoint_auth_method: "none",
-        grant_types: ["authorization_code", "refresh_token"],
-        response_types: ["code"],
-        scope: SCOPES,
-      }),
-    });
-    if (
-      !registration.client_id ||
-      (registration.token_endpoint_auth_method &&
-        registration.token_endpoint_auth_method !== "none")
-    ) {
-      throw new Error("Search1API OAuth did not register a public client.");
+    let clientId = saved?.clientId;
+    if (!clientId) {
+      const registration = await json<{
+        client_id: string;
+        token_endpoint_auth_method?: string;
+      }>(metadata.registration_endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          client_name: "Search1API for Magpie",
+          application_type: "native",
+          redirect_uris: [redirect],
+          token_endpoint_auth_method: "none",
+          grant_types: ["authorization_code", "refresh_token"],
+          response_types: ["code"],
+          scope: SCOPES,
+        }),
+      });
+      if (
+        !registration.client_id ||
+        (registration.token_endpoint_auth_method &&
+          registration.token_endpoint_auth_method !== "none")
+      ) {
+        throw new Error("Search1API OAuth did not register a public client.");
+      }
+      clientId = registration.client_id;
+      if (clientFile) {
+        const record: SavedClient = {
+          issuer: metadata.issuer,
+          clientId,
+          redirectUri: redirect,
+        };
+        // The client is public: losing this file costs one registration.
+        await mkdir(dirname(clientFile), { recursive: true })
+          .then(() =>
+            writeFile(clientFile, JSON.stringify(record), { mode: 0o600 }),
+          )
+          .catch(() => {});
+      }
     }
     const url = new URL(metadata.authorization_endpoint);
     for (const [key, value] of Object.entries({
       response_type: "code",
-      client_id: registration.client_id,
+      client_id: clientId,
       redirect_uri: redirect,
       scope: SCOPES,
       state,
       code_challenge: challenge,
       code_challenge_method: "S256",
+      utm_source: SOURCE,
     }))
       url.searchParams.set(key, value);
     let completed = false;
+    // A reused client the server no longer knows fails in the browser, so a
+    // sign-in that does not finish registers afresh next time.
+    const forget = async () => {
+      if (saved && clientFile) await unlink(clientFile).catch(() => {});
+    };
     return {
       url: url.href,
       instructions:
@@ -249,8 +324,10 @@ export async function startOAuth(baseUrl: string, timeoutMs = LOGIN_TIMEOUT) {
         completed = true;
         try {
           const response = await result;
-          if (response.error)
+          if (response.error) {
+            await forget();
             return { type: "failed" as const, error: response.error };
+          }
           const tokens = await json<Tokens>(metadata.token_endpoint, {
             method: "POST",
             headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -258,17 +335,14 @@ export async function startOAuth(baseUrl: string, timeoutMs = LOGIN_TIMEOUT) {
               grant_type: "authorization_code",
               code: response.code!,
               redirect_uri: redirect,
-              client_id: registration.client_id,
+              client_id: clientId,
               code_verifier: verifier,
             }),
           });
-          const { type: _, ...auth } = credential(
-            tokens,
-            registration.client_id,
-            metadata,
-          );
+          const { type: _, ...auth } = credential(tokens, clientId, metadata);
           return { type: "success" as const, ...auth };
         } catch (error) {
+          await forget();
           return {
             type: "failed" as const,
             error:

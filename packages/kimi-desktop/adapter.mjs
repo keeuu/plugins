@@ -51,10 +51,25 @@ function authenticated(actual, key) {
   return left.length === right.length && crypto.timingSafeEqual(left, right);
 }
 
-export function defaultKimiDirectory(home = os.homedir()) {
-  const support = process.platform === 'win32' ? process.env.APPDATA || path.join(home, 'AppData', 'Roaming')
-    : process.platform === 'darwin' ? path.join(home, 'Library', 'Application Support') : path.join(home, '.config');
-  return path.join(support, 'kimi-desktop', 'daimon-share', 'daimon');
+// Kimi's daimon folder, as Kimi 3.2.21 finds it: under the shareDir its
+// <userData>/daimon-storage.json names ({"version":1,"shareDir":<absolute>}),
+// else under <userData>/daimon-share. On Windows Kimi writes that pointer
+// for a new user who installed it on another drive than %APPDATA%'s
+// (D:\KimiData\daimon-share), and on any system when the user moves its
+// storage. A pointer Kimi wouldn't take leaves the default, as in Kimi
+// (magpie-community/plugins#425).
+export function defaultKimiDirectory(home = os.homedir(), { platform = process.platform, appdata = process.env.APPDATA,
+  read = file => { if (fs.statSync(file).size > 64 * 1024) throw Error('too large'); return fs.readFileSync(file, 'utf8'); } } = {}) {
+  const P = platform === 'win32' ? path.win32 : path.posix;
+  const support = platform === 'win32' ? appdata || P.join(home, 'AppData', 'Roaming')
+    : platform === 'darwin' ? P.join(home, 'Library', 'Application Support') : P.join(home, '.config');
+  const data = P.join(support, 'kimi-desktop');
+  let share = P.join(data, 'daimon-share');
+  try {
+    const dir = JSON.parse(read(P.join(data, 'daimon-storage.json')).replace(/^\uFEFF/, ''))?.shareDir;
+    if (typeof dir === 'string' && dir.trim() && P.isAbsolute(dir)) share = P.resolve(dir);
+  } catch {}
+  return P.join(share, 'daimon');
 }
 
 export class KimiAdapter {
